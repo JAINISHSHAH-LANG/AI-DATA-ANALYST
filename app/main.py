@@ -1,96 +1,200 @@
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.openapi.utils import get_openapi
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+from fastapi.responses import FileResponse
 import pandas as pd
 import os
+import uuid
+from typing import Dict
 
-app = FastAPI(title="AI Data Analyst API", version="1.0")
+app = FastAPI(title="AI Data Analyst API 🚀")
 
 UPLOAD_FOLDER = "uploads"
 CLEANED_FOLDER = "cleaned"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(CLEANED_FOLDER, exist_ok=True)
 
+# In-memory task store: tracks progress and result
+task_store: Dict[str, Dict] = {}
 
-@app.get("/", tags=["Root"])
+@app.get("/")
 def read_root():
-    return {"message": "✅ AI Data Analyst API is running 🚀"}
+    return {"message": "AI Data Analyst API is running 🚀"}
 
-
-@app.post("/upload/", tags=["Upload & Analyze"])
-async def upload_file(
-    file: UploadFile = File(
-        ...,
-        description="Upload your CSV file here for cleaning and analysis."
-    )
-):
-    """
-    Upload a CSV file, clean missing values, generate analysis,
-    and save a cleaned version for download.
-    """
-    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
-    try:
-        contents = await file.read()
-        with open(file_path, "wb") as f:
-            f.write(contents)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error saving file: {str(e)}")
-
+# Background task: clean data + generate analysis
+def clean_and_analyze(file_path: str, cleaned_path: str, task_id: str, filename: str):
     try:
         df = pd.read_csv(file_path)
+        total_cols = len(df.columns)
 
-        for col in df.columns:
+        # Cleaning
+        for idx, col in enumerate(df.columns, start=1):
             if df[col].dtype in ["int64", "float64"]:
                 df[col].fillna(df[col].mean(), inplace=True)
             else:
-                df[col].fillna(
-                    df[col].mode()[0] if not df[col].mode().empty else "Unknown",
-                    inplace=True
-                )
+                df[col].fillna(df[col].mode()[0] if not df[col].mode().empty else "Unknown", inplace=True)
+            # Update progress
+            task_store[task_id]["progress"] = f"{int((idx / total_cols) * 50)}%"
 
-        cleaned_filename = f"cleaned_{file.filename}"
-        cleaned_path = os.path.join(CLEANED_FOLDER, cleaned_filename)
+        # Save cleaned file
         df.to_csv(cleaned_path, index=False)
+        task_store[task_id]["progress"] = "50%"
 
-        info = {
-            "original_filename": file.filename,
-            "cleaned_filename": cleaned_filename,
+        # Generate analysis
+        analysis = {
+            "filename": filename,
             "rows": len(df),
             "columns": list(df.columns),
             "data_types": df.dtypes.astype(str).to_dict(),
             "missing_values_after_cleaning": df.isnull().sum().to_dict(),
-            "summary_statistics": df.describe(include="all", datetime_is_numeric=True).to_dict(),
-            "cleaned_file_download_url": f"/download/{cleaned_filename}"
+            "summary_statistics": df.describe(include="all").to_dict(),
+            "cleaned_file_download": f"/download/{os.path.basename(cleaned_path)}"
         }
 
-        return JSONResponse(content=info)
-
+        task_store[task_id]["progress"] = "100%"
+        task_store[task_id]["result"] = analysis
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Error processing file: {str(e)}")
+        task_store[task_id]["progress"] = f"Error: {str(e)}"
+        task_store[task_id]["result"] = None
 
+# Upload endpoint
+@app.post("/upload/")
+async def upload_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
+    task_id = str(uuid.uuid4())
+    filename = file.filename
+    file_path = os.path.join(UPLOAD_FOLDER, f"{task_id}_{filename}")
+    cleaned_path = os.path.join(CLEANED_FOLDER, f"cleaned_{filename}")
 
-@app.get("/download/{filename}", tags=["Download"])
+    contents = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(contents)
+
+    # Initialize task store
+    task_store[task_id] = {"progress": "0%", "result": None}
+
+    # Run background cleaning + analysis
+    background_tasks.add_task(clean_and_analyze, file_path, cleaned_path, task_id, filename)
+
+    return {"task_id": task_id, "message": "File uploaded successfully. Cleaning and analysis started."}
+
+# Progress + result endpoint
+@app.get("/progress/{task_id}")
+def check_progress(task_id: str):
+    task = task_store.get(task_id)
+    if not task:
+        return {"error": "Invalid task ID"}
+    return {"task_id": task_id, "progress": task["progress"], "result": task["result"]}
+
+# Download endpoint
+@app.get("/download/{filename}")
 async def download_file(filename: str):
     file_path = os.path.join(CLEANED_FOLDER, filename)
     if os.path.exists(file_path):
         return FileResponse(file_path, filename=filename, media_type="text/csv")
-    raise HTTPException(status_code=404, detail="File not found")
+    return {"error": "File not found"}
 
 
-# Optional: Custom OpenAPI info for Swagger
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
-    openapi_schema = get_openapi(
-        title="AI Data Analyst API",
-        version="1.0",
-        description="API for uploading CSVs, automatic cleaning, analysis, and downloading cleaned files.",
-        routes=app.routes,
-    )
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
 
-app.openapi = custom_openapi
+
+
+
+
+
+
+
+
+
+# from fastapi import FastAPI, UploadFile, File, HTTPException
+# from fastapi.responses import FileResponse, JSONResponse
+# from fastapi.openapi.utils import get_openapi
+# import pandas as pd
+# import os
+
+# app = FastAPI(title="AI Data Analyst API", version="1.0")
+
+# UPLOAD_FOLDER = "uploads"
+# CLEANED_FOLDER = "cleaned"
+# os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+# os.makedirs(CLEANED_FOLDER, exist_ok=True)
+
+
+# @app.get("/", tags=["Root"])
+# def read_root():
+#     return {"message": "✅ AI Data Analyst API is running 🚀"}
+
+
+# @app.post("/upload/", tags=["Upload & Analyze"])
+# async def upload_file(
+#     file: UploadFile = File(
+#         ...,
+#         description="Upload your CSV file here for cleaning and analysis."
+#     )
+# ):
+#     """
+#     Upload a CSV file, clean missing values, generate analysis,
+#     and save a cleaned version for download.
+#     """
+#     file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+#     try:
+#         contents = await file.read()
+#         with open(file_path, "wb") as f:
+#             f.write(contents)
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Error saving file: {str(e)}")
+
+#     try:
+#         df = pd.read_csv(file_path)
+
+#         for col in df.columns:
+#             if df[col].dtype in ["int64", "float64"]:
+#                 df[col].fillna(df[col].mean(), inplace=True)
+#             else:
+#                 df[col].fillna(
+#                     df[col].mode()[0] if not df[col].mode().empty else "Unknown",
+#                     inplace=True
+#                 )
+
+#         cleaned_filename = f"cleaned_{file.filename}"
+#         cleaned_path = os.path.join(CLEANED_FOLDER, cleaned_filename)
+#         df.to_csv(cleaned_path, index=False)
+
+#         info = {
+#             "original_filename": file.filename,
+#             "cleaned_filename": cleaned_filename,
+#             "rows": len(df),
+#             "columns": list(df.columns),
+#             "data_types": df.dtypes.astype(str).to_dict(),
+#             "missing_values_after_cleaning": df.isnull().sum().to_dict(),
+#             "summary_statistics": df.describe(include="all", datetime_is_numeric=True).to_dict(),
+#             "cleaned_file_download_url": f"/download/{cleaned_filename}"
+#         }
+
+#         return JSONResponse(content=info)
+
+#     except Exception as e:
+#         raise HTTPException(status_code=400, detail=f"Error processing file: {str(e)}")
+
+
+# @app.get("/download/{filename}", tags=["Download"])
+# async def download_file(filename: str):
+#     file_path = os.path.join(CLEANED_FOLDER, filename)
+#     if os.path.exists(file_path):
+#         return FileResponse(file_path, filename=filename, media_type="text/csv")
+#     raise HTTPException(status_code=404, detail="File not found")
+
+
+# # Optional: Custom OpenAPI info for Swagger
+# def custom_openapi():
+#     if app.openapi_schema:
+#         return app.openapi_schema
+#     openapi_schema = get_openapi(
+#         title="AI Data Analyst API",
+#         version="1.0",
+#         description="API for uploading CSVs, automatic cleaning, analysis, and downloading cleaned files.",
+#         routes=app.routes,
+#     )
+#     app.openapi_schema = openapi_schema
+#     return app.openapi_schema
+
+# app.openapi = custom_openapi
 
 
 
