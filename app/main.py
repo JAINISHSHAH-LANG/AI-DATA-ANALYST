@@ -1,67 +1,147 @@
-# main.py
-from fastapi import FastAPI
-from pydantic import BaseModel
-import networkx as nx
-import matplotlib.pyplot as plt
-import io, base64, pandas as pd
+from fastapi import FastAPI, UploadFile, File
+from fastapi.responses import HTMLResponse
+import pandas as pd
 
 app = FastAPI()
 
-class FilePath(BaseModel):
-    file_path: str
+# Home page with upload form
+@app.get("/", response_class=HTMLResponse)
+async def main():
+    content = """
+    <html>
+        <head>
+            <title>AI Data Analyst - Upload</title>
+        </head>
+        <body style="font-family: Arial; margin: 50px;">
+            <h2>Upload your CSV file</h2>
+            <form action="/upload" enctype="multipart/form-data" method="post">
+                <input name="file" type="file" accept=".csv">
+                <input type="submit" value="Upload">
+            </form>
+        </body>
+    </html>
+    """
+    return content
 
-@app.post("/analyze")
-def analyze(file: FilePath):
-    # Load edges
-    edges_df = pd.read_csv(file.file_path)
-    if edges_df.shape[1] < 2:
-        return {"error": "CSV must have at least two columns (source, target)"}
 
-    # Build graph
-    G = nx.from_pandas_edgelist(edges_df, edges_df.columns[0], edges_df.columns[1])
-
-    # --- Network Metrics ---
-    edge_count = G.number_of_edges()
-    degree_dict = dict(G.degree())
-    highest_degree_node = max(degree_dict, key=degree_dict.get)
-    average_degree = sum(degree_dict.values()) / len(degree_dict)
-    density = nx.density(G)
-
+# Upload + Preview
+@app.post("/upload", response_class=HTMLResponse)
+async def upload(file: UploadFile = File(...)):
     try:
-        shortest_path = nx.shortest_path(G, source="Alice", target="Eve")
-    except Exception:
-        shortest_path = None
+        df = pd.read_csv(file.file)
 
-    # --- Plot network graph ---
-    plt.figure(figsize=(6, 4))
-    nx.draw(G, with_labels=True, node_color="lightblue", edge_color="gray", node_size=500)
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    buf.seek(0)
-    network_graph_b64 = base64.b64encode(buf.read()).decode("utf-8")
-    plt.close()
+        # Convert first 10 rows into HTML table
+        table_html = df.head(10).to_html(classes="table", border=1, index=False)
 
-    # --- Plot degree histogram ---
-    plt.figure(figsize=(6, 4))
-    plt.hist(list(degree_dict.values()), bins=range(1, max(degree_dict.values())+2), color="skyblue", edgecolor="black")
-    plt.xlabel("Degree")
-    plt.ylabel("Frequency")
-    plt.title("Degree Histogram")
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png")
-    buf.seek(0)
-    degree_histogram_b64 = base64.b64encode(buf.read()).decode("utf-8")
-    plt.close()
+        content = f"""
+        <html>
+            <head>
+                <title>Preview - {file.filename}</title>
+                <style>
+                    body {{ font-family: Arial; margin: 50px; }}
+                    table {{ border-collapse: collapse; width: 80%; }}
+                    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: center; }}
+                    th {{ background-color: #f2f2f2; }}
+                </style>
+            </head>
+            <body>
+                <h2>Uploaded File: {file.filename}</h2>
+                <h3>Preview (first 10 rows)</h3>
+                {table_html}
+                <br>
+                <a href="/">Upload another file</a>
+            </body>
+        </html>
+        """
+        return content
 
-    return {
-        "edge_count": edge_count,
-        "highest_degree_node": highest_degree_node,
-        "average_degree": average_degree,
-        "density": density,
-        "shortest_path_alice_eve": shortest_path,
-        "network_graph": network_graph_b64,
-        "degree_histogram": degree_histogram_b64
-    }
+    except Exception as e:
+        return f"<h3>Error: {str(e)}</h3><br><a href='/'>Go back</a>"
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# # main.py
+# from fastapi import FastAPI
+# from pydantic import BaseModel
+# import networkx as nx
+# import matplotlib.pyplot as plt
+# import io, base64, pandas as pd
+
+# app = FastAPI()
+
+# class FilePath(BaseModel):
+#     file_path: str
+
+# @app.post("/analyze")
+# def analyze(file: FilePath):
+#     # Load edges
+#     edges_df = pd.read_csv(file.file_path)
+#     if edges_df.shape[1] < 2:
+#         return {"error": "CSV must have at least two columns (source, target)"}
+
+#     # Build graph
+#     G = nx.from_pandas_edgelist(edges_df, edges_df.columns[0], edges_df.columns[1])
+
+#     # --- Network Metrics ---
+#     edge_count = G.number_of_edges()
+#     degree_dict = dict(G.degree())
+#     highest_degree_node = max(degree_dict, key=degree_dict.get)
+#     average_degree = sum(degree_dict.values()) / len(degree_dict)
+#     density = nx.density(G)
+
+#     try:
+#         shortest_path = nx.shortest_path(G, source="Alice", target="Eve")
+#     except Exception:
+#         shortest_path = None
+
+#     # --- Plot network graph ---
+#     plt.figure(figsize=(6, 4))
+#     nx.draw(G, with_labels=True, node_color="lightblue", edge_color="gray", node_size=500)
+#     buf = io.BytesIO()
+#     plt.savefig(buf, format="png")
+#     buf.seek(0)
+#     network_graph_b64 = base64.b64encode(buf.read()).decode("utf-8")
+#     plt.close()
+
+#     # --- Plot degree histogram ---
+#     plt.figure(figsize=(6, 4))
+#     plt.hist(list(degree_dict.values()), bins=range(1, max(degree_dict.values())+2), color="skyblue", edgecolor="black")
+#     plt.xlabel("Degree")
+#     plt.ylabel("Frequency")
+#     plt.title("Degree Histogram")
+#     buf = io.BytesIO()
+#     plt.savefig(buf, format="png")
+#     buf.seek(0)
+#     degree_histogram_b64 = base64.b64encode(buf.read()).decode("utf-8")
+#     plt.close()
+
+#     return {
+#         "edge_count": edge_count,
+#         "highest_degree_node": highest_degree_node,
+#         "average_degree": average_degree,
+#         "density": density,
+#         "shortest_path_alice_eve": shortest_path,
+#         "network_graph": network_graph_b64,
+#         "degree_histogram": degree_histogram_b64
+#     }
 
 
 
