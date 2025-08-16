@@ -1,310 +1,480 @@
 # app/main.py
-import asyncio
-import base64
+import os
 import io
 import json
-import os
+import base64
 import time
+import asyncio
+from typing import List, Dict, Any
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
 import pandas as pd
+import numpy as np
 import matplotlib
-
-# Use Agg backend for headless servers
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import networkx as nx
 
-from fastapi import FastAPI, UploadFile, File, Request, HTTPException
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# Optional libs
-try:
-    import duckdb
-except Exception:
-    duckdb = None
-
-try:
-    import httpx
-except Exception:
-    httpx = None
-
 # Configuration
-REQUEST_DEADLINE_SECONDS = int(os.getenv("REQUEST_DEADLINE_SECONDS", "170"))
-MAX_PLOT_BYTES = int(os.getenv("MAX_PLOT_BYTES", "100000"))
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
-APP_NAME = "AI Data Analyst Agent"
+MAX_PLOT_BYTES = 100000
+REQUEST_DEADLINE_SECONDS = 170
 
-app = FastAPI(title=APP_NAME)
+app = FastAPI(title="AI Data Analyst Agent")
 
-# ------------------ Utilities ------------------ #
+# ---------------- Utilities ---------------- #
 class Deadline:
     def __init__(self, seconds: float):
         self.start = time.time()
         self.deadline = self.start + seconds
-
     def remaining(self) -> float:
         return max(0.0, self.deadline - time.time())
 
-def dumps_json(obj: Any) -> str:
-    try:
-        import orjson
-        return orjson.dumps(obj).decode()
-    except Exception:
-        return json.dumps(obj, default=str)
-
-def plot_scatter_regression(x: np.ndarray, y: np.ndarray, xlabel: str = "x", ylabel: str = "y", title: Optional[str] = None) -> str:
-    fig = plt.figure(figsize=(4, 3), dpi=100)
-    ax = fig.add_subplot(111)
-    ax.scatter(x, y, s=10)
-    try:
-        a, b = np.polyfit(x, y, 1)
-        x_line = np.linspace(np.min(x), np.max(x), 200)
-        y_line = a * x_line + b
-        ax.plot(x_line, y_line, linestyle=":", color="red", linewidth=1.5)
-    except Exception:
-        pass
-    ax.set_xlabel(xlabel)
-    ax.set_ylabel(ylabel)
-    if title:
-        ax.set_title(title)
-    ax.grid(True)
-
-    def encode_png(dpi: int = 100) -> bytes:
+def plot_to_base64(fig):
+    bio = io.BytesIO()
+    fig.savefig(bio, format="png", bbox_inches="tight")
+    plt.close(fig)
+    data = bio.getvalue()
+    if len(data) > MAX_PLOT_BYTES:
+        # resize by lowering DPI
         bio = io.BytesIO()
-        fig.savefig(bio, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.1)
-        return bio.getvalue()
-
-    # Adjust DPI until under MAX_PLOT_BYTES
-    for dpi in [140, 120, 100, 90, 80, 70, 60, 50]:
-        data = encode_png(dpi=dpi)
-        if len(data) <= MAX_PLOT_BYTES:
-            plt.close(fig)
-            return "data:image/png;base64," + base64.b64encode(data).decode()
-
-    # Fallback to smaller/WEBP
-    try:
-        from PIL import Image
-        data = encode_png(dpi=50)
-        img = Image.open(io.BytesIO(data)).convert("RGB")
-        out = io.BytesIO()
-        img.save(out, format="WEBP", quality=80, method=6)
+        fig.savefig(bio, format="png", dpi=50, bbox_inches="tight")
         plt.close(fig)
-        return "data:image/webp;base64," + base64.b64encode(out.getvalue()).decode()
-    except Exception:
-        data = encode_png(dpi=50)
-        plt.close(fig)
-        return "data:image/png;base64," + base64.b64encode(data).decode()
+        data = bio.getvalue()
+    return "data:image/png;base64," + base64.b64encode(data).decode()
 
-# ------------------ File loaders ------------------ #
-async def load_uploaded_files(files: List[UploadFile]) -> Tuple[Dict[str, bytes], Dict[str, pd.DataFrame]]:
-    raw: Dict[str, bytes] = {}
-    dfs: Dict[str, pd.DataFrame] = {}
+def plot_network_graph(G: nx.Graph) -> str:
+    fig = plt.figure(figsize=(4,3))
+    nx.draw_networkx(G, with_labels=True, node_color='skyblue', edge_color='gray', node_size=500, font_size=10)
+    return plot_to_base64(fig)
+
+def plot_degree_histogram(G: nx.Graph) -> str:
+    degrees = [d for n,d in G.degree()]
+    fig = plt.figure(figsize=(4,3))
+    plt.hist(degrees, bins=range(min(degrees), max(degrees)+2))
+    plt.xlabel("Degree")
+    plt.ylabel("Frequency")
+    plt.title("Degree Histogram")
+    return plot_to_base64(fig)
+
+async def load_uploaded_files(files: List[UploadFile]) -> Dict[str, pd.DataFrame]:
+    dfs = {}
     for f in files:
-        filename = (f.filename or "unnamed").strip()
-        try:
+        if f.filename.lower().endswith(".csv"):
             content = await f.read()
-        except Exception:
-            content = b""
-        raw[filename] = content
-        lower = filename.lower()
-        try:
-            if lower.endswith(".csv"):
-                dfs[filename] = pd.read_csv(io.BytesIO(content))
-            elif lower.endswith(".tsv"):
-                dfs[filename] = pd.read_csv(io.BytesIO(content), sep="\t")
-            elif lower.endswith(".parquet"):
-                try:
-                    dfs[filename] = pd.read_parquet(io.BytesIO(content))
-                except Exception:
-                    if duckdb:
-                        pass
-            elif lower.endswith(".json"):
-                try:
-                    dfs[filename] = pd.read_json(io.BytesIO(content), lines=False)
-                except Exception:
-                    try:
-                        dfs[filename] = pd.read_json(io.BytesIO(content), lines=True)
-                    except Exception:
-                        pass
-            elif lower.endswith(".xlsx") or lower.endswith(".xls"):
-                try:
-                    dfs[filename] = pd.read_excel(io.BytesIO(content))
-                except Exception:
-                    pass
-        except Exception:
-            continue
-    return raw, dfs
+            dfs[f.filename] = pd.read_csv(io.BytesIO(content))
+    return dfs
 
-# ------------------ Question Parsing ------------------ #
 @dataclass
 class ParsedQuestions:
     mode: str
     items: List[str]
 
 def parse_questions_text(qtext: str) -> ParsedQuestions:
-    mode = "array" if "respond with a json array" in qtext.lower() else "object" if "respond with a json object" in qtext.lower() else "array"
     lines = [l.strip() for l in qtext.splitlines() if l.strip()]
-    items: List[str] = []
-    for l in lines:
-        if l.lstrip().startswith(("-", "*")) or l.lstrip()[0:2].strip().isdigit():
-            cleaned = l.lstrip("-*0123456789. ").strip()
-            items.append(cleaned)
-        else:
-            if l.endswith("?"):
-                items.append(l)
-    if not items:
-        items = [qtext.strip()]
-    return ParsedQuestions(mode=mode, items=items)
+    items = [l.lstrip("-*0123456789. ").strip() for l in lines]
+    return ParsedQuestions(mode="array", items=items)
 
-# ------------------ Main API Handler ------------------ #
-@app.post("/api/", response_class=PlainTextResponse)
-async def api_handler(request: Request, files: List[UploadFile] = File([])):
-    deadline = Deadline(REQUEST_DEADLINE_SECONDS)
+# ---------------- API Endpoints ---------------- #
 
-    async def _process() -> Any:
-        qtext: Optional[str] = None
-        other_uploads: List[UploadFile] = []
+@app.post("/api/")
+async def api_handler(files: List[UploadFile] = File(...)):
+    dfs_map = await load_uploaded_files(files)
 
-        for f in files:
-            fname = (f.filename or "").strip()
-            if fname.lower() == "questions.txt":
-                try:
-                    qtext = (await f.read()).decode("utf-8", errors="replace")
-                except Exception:
-                    qtext = ""
-            else:
-                other_uploads.append(f)
+    # Get questions.txt
+    question_files = [f for f in files if f.filename.lower() == "questions.txt"]
+    if not question_files:
+        return JSONResponse(content={"error": "questions.txt missing"}, status_code=400)
+    
+    qtext = (await question_files[0].read()).decode("utf-8", errors="replace")
+    parsed = parse_questions_text(qtext)
 
-        if not qtext:
-            form = await request.form()
-            for key, val in form.multi_items():
-                if key.lower() in ("questions.txt", "questions"):
-                    if isinstance(val, UploadFile):
-                        qtext = (await val.read()).decode("utf-8", errors="replace")
-                    else:
-                        qtext = str(val)
-                    break
+    return JSONResponse({
+        "parsed_questions": parsed.items,
+        "uploaded_files": list(dfs_map.keys())
+    })
 
-        if not qtext:
-            return JSONResponse(content={"error": "questions.txt missing"}, status_code=400)
-
-        parsed = parse_questions_text(qtext)
-        raw_map, dfs_map = await load_uploaded_files(other_uploads)
-
-        # ------------------ Phase 2: Sample Weather Analysis ------------------ #
-        if "sample-weather.csv" in dfs_map:
-            df = dfs_map["sample-weather.csv"]
-            required_columns = ["temperature_c", "precipitation_mm", "date"]
-            missing_cols = [c for c in required_columns if c not in df.columns]
-            if missing_cols:
-                raise HTTPException(status_code=500, detail=f"Missing columns in CSV: {missing_cols}")
-            try:
-                avg_temp = round(df["temperature_c"].mean(), 3)
-                min_temp = int(df["temperature_c"].min())
-                avg_precip = round(df["precipitation_mm"].mean(), 3)
-                max_precip_idx = df["precipitation_mm"].idxmax()
-                max_precip_date = str(df.loc[max_precip_idx, "date"])
-                corr = round(df["temperature_c"].corr(df["precipitation_mm"]), 10)
-
-                # Base64 charts
-                temp_line_chart = plot_scatter_regression(
-                    np.arange(len(df)), df["temperature_c"].to_numpy(),
-                    xlabel="Index", ylabel="Temperature (°C)", title="Temperature Trend"
-                )
-                precip_histogram = plot_scatter_regression(
-                    np.arange(len(df)), df["precipitation_mm"].to_numpy(),
-                    xlabel="Index", ylabel="Precipitation (mm)", title="Precipitation Histogram"
-                )
-
-                analysis_result = {
-                    "average_temp_c": avg_temp,
-                    "min_temp_c": min_temp,
-                    "average_precip_mm": avg_precip,
-                    "max_precip_date": max_precip_date,
-                    "temp_precip_correlation": corr,
-                    "temp_line_chart": temp_line_chart,
-                    "precip_histogram": precip_histogram
-                }
-                return JSONResponse(content=analysis_result)
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=str(e))
-
-        # Fallback pipeline
-        return {"message": "Fallback processing pipeline (existing logic)"}
-
-    try:
-        return await asyncio.wait_for(_process(), timeout=deadline.remaining())
-    except asyncio.TimeoutError:
-        return PlainTextResponse(content=dumps_json([None, "", float("nan"), ""]), media_type="application/json", status_code=504)
-    except Exception as e:
-        return PlainTextResponse(content=dumps_json({"error": str(e)}), media_type="application/json", status_code=500)
-
-# ------------------ Network Analysis Endpoint (NEW) ------------------ #
+# ---------------- Analyze Endpoint ---------------- #
 class AnalyzeRequest(BaseModel):
-    file_path: str  # Path to CSV file
-
-def plot_network_graph(G: nx.Graph) -> str:
-    fig = plt.figure(figsize=(4, 4), dpi=100)
-    nx.draw(G, with_labels=True, node_color='lightblue', edge_color='gray', node_size=500, font_size=8)
-    bio = io.BytesIO()
-    fig.savefig(bio, format='png', bbox_inches='tight', pad_inches=0.1)
-    plt.close(fig)
-    data = bio.getvalue()
-    if len(data) > MAX_PLOT_BYTES:
-        return "data:image/png;base64," + base64.b64encode(data[:MAX_PLOT_BYTES]).decode()
-    return "data:image/png;base64," + base64.b64encode(data).decode()
-
-def plot_degree_histogram(G: nx.Graph) -> str:
-    fig = plt.figure(figsize=(4, 3), dpi=100)
-    degrees = [d for _, d in G.degree()]
-    plt.hist(degrees, bins=range(max(degrees)+2), color='lightgreen', edgecolor='black')
-    plt.xlabel("Degree")
-    plt.ylabel("Frequency")
-    bio = io.BytesIO()
-    fig.savefig(bio, format='png', bbox_inches='tight', pad_inches=0.1)
-    plt.close(fig)
-    data = bio.getvalue()
-    if len(data) > MAX_PLOT_BYTES:
-        return "data:image/png;base64," + base64.b64encode(data[:MAX_PLOT_BYTES]).decode()
-    return "data:image/png;base64," + base64.b64encode(data).decode()
+    file_path: str
 
 @app.post("/analyze")
 async def analyze_network(req: AnalyzeRequest):
     if not os.path.exists(req.file_path):
         raise HTTPException(status_code=400, detail=f"File not found: {req.file_path}")
+
+    df = pd.read_csv(req.file_path)
+    edges = list(df.itertuples(index=False, name=None))
+    G = nx.Graph()
+    G.add_edges_from(edges)
+
+    edge_count = G.number_of_edges()
+    highest_degree_node = max(G.degree, key=lambda x: x[1])[0]
+    average_degree = round(sum(dict(G.degree()).values()) / G.number_of_nodes(), 1)
+    density = round(nx.density(G), 1)
     try:
-        df = pd.read_csv(req.file_path)
-        edges = list(df.itertuples(index=False, name=None))
-        G = nx.Graph()
-        G.add_edges_from(edges)
-
-        edge_count = G.number_of_edges()
-        highest_degree_node = max(G.degree, key=lambda x: x[1])[0]
-        average_degree = round(sum(dict(G.degree()).values()) / G.number_of_nodes(), 1)
-        density = round(nx.density(G), 1)
         shortest_path_alice_eve = nx.shortest_path_length(G, source="Alice", target="Eve")
+    except nx.NetworkXNoPath:
+        shortest_path_alice_eve = None
 
-        return {
-            "edge_count": edge_count,
-            "highest_degree_node": highest_degree_node,
-            "average_degree": average_degree,
-            "density": density,
-            "shortest_path_alice_eve": shortest_path_alice_eve,
-            "network_graph": plot_network_graph(G),
-            "degree_histogram": plot_degree_histogram(G)
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return JSONResponse({
+        "edge_count": edge_count,
+        "highest_degree_node": highest_degree_node,
+        "average_degree": average_degree,
+        "density": density,
+        "shortest_path_alice_eve": shortest_path_alice_eve,
+        "network_graph": plot_network_graph(G),
+        "degree_histogram": plot_degree_histogram(G)
+    })
 
-# ------------------ Health endpoint ------------------ #
+# ---------------- Health Check ---------------- #
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# # app/main.py
+# import asyncio
+# import base64
+# import io
+# import json
+# import os
+# import time
+# from dataclasses import dataclass
+# from typing import Any, Dict, List, Optional, Tuple
+
+# import numpy as np
+# import pandas as pd
+# import matplotlib
+
+# # Use Agg backend for headless servers
+# matplotlib.use("Agg")
+# import matplotlib.pyplot as plt
+# import networkx as nx
+
+# from fastapi import FastAPI, UploadFile, File, Request, HTTPException
+# from fastapi.responses import JSONResponse, PlainTextResponse
+# from pydantic import BaseModel
+
+# # Optional libs
+# try:
+#     import duckdb
+# except Exception:
+#     duckdb = None
+
+# try:
+#     import httpx
+# except Exception:
+#     httpx = None
+
+# # Configuration
+# REQUEST_DEADLINE_SECONDS = int(os.getenv("REQUEST_DEADLINE_SECONDS", "170"))
+# MAX_PLOT_BYTES = int(os.getenv("MAX_PLOT_BYTES", "100000"))
+# OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+# APP_NAME = "AI Data Analyst Agent"
+
+# app = FastAPI(title=APP_NAME)
+
+# # ------------------ Utilities ------------------ #
+# class Deadline:
+#     def __init__(self, seconds: float):
+#         self.start = time.time()
+#         self.deadline = self.start + seconds
+
+#     def remaining(self) -> float:
+#         return max(0.0, self.deadline - time.time())
+
+# def dumps_json(obj: Any) -> str:
+#     try:
+#         import orjson
+#         return orjson.dumps(obj).decode()
+#     except Exception:
+#         return json.dumps(obj, default=str)
+
+# def plot_scatter_regression(x: np.ndarray, y: np.ndarray, xlabel: str = "x", ylabel: str = "y", title: Optional[str] = None) -> str:
+#     fig = plt.figure(figsize=(4, 3), dpi=100)
+#     ax = fig.add_subplot(111)
+#     ax.scatter(x, y, s=10)
+#     try:
+#         a, b = np.polyfit(x, y, 1)
+#         x_line = np.linspace(np.min(x), np.max(x), 200)
+#         y_line = a * x_line + b
+#         ax.plot(x_line, y_line, linestyle=":", color="red", linewidth=1.5)
+#     except Exception:
+#         pass
+#     ax.set_xlabel(xlabel)
+#     ax.set_ylabel(ylabel)
+#     if title:
+#         ax.set_title(title)
+#     ax.grid(True)
+
+#     def encode_png(dpi: int = 100) -> bytes:
+#         bio = io.BytesIO()
+#         fig.savefig(bio, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.1)
+#         return bio.getvalue()
+
+#     # Adjust DPI until under MAX_PLOT_BYTES
+#     for dpi in [140, 120, 100, 90, 80, 70, 60, 50]:
+#         data = encode_png(dpi=dpi)
+#         if len(data) <= MAX_PLOT_BYTES:
+#             plt.close(fig)
+#             return "data:image/png;base64," + base64.b64encode(data).decode()
+
+#     # Fallback to smaller/WEBP
+#     try:
+#         from PIL import Image
+#         data = encode_png(dpi=50)
+#         img = Image.open(io.BytesIO(data)).convert("RGB")
+#         out = io.BytesIO()
+#         img.save(out, format="WEBP", quality=80, method=6)
+#         plt.close(fig)
+#         return "data:image/webp;base64," + base64.b64encode(out.getvalue()).decode()
+#     except Exception:
+#         data = encode_png(dpi=50)
+#         plt.close(fig)
+#         return "data:image/png;base64," + base64.b64encode(data).decode()
+
+# # ------------------ File loaders ------------------ #
+# async def load_uploaded_files(files: List[UploadFile]) -> Tuple[Dict[str, bytes], Dict[str, pd.DataFrame]]:
+#     raw: Dict[str, bytes] = {}
+#     dfs: Dict[str, pd.DataFrame] = {}
+#     for f in files:
+#         filename = (f.filename or "unnamed").strip()
+#         try:
+#             content = await f.read()
+#         except Exception:
+#             content = b""
+#         raw[filename] = content
+#         lower = filename.lower()
+#         try:
+#             if lower.endswith(".csv"):
+#                 dfs[filename] = pd.read_csv(io.BytesIO(content))
+#             elif lower.endswith(".tsv"):
+#                 dfs[filename] = pd.read_csv(io.BytesIO(content), sep="\t")
+#             elif lower.endswith(".parquet"):
+#                 try:
+#                     dfs[filename] = pd.read_parquet(io.BytesIO(content))
+#                 except Exception:
+#                     if duckdb:
+#                         pass
+#             elif lower.endswith(".json"):
+#                 try:
+#                     dfs[filename] = pd.read_json(io.BytesIO(content), lines=False)
+#                 except Exception:
+#                     try:
+#                         dfs[filename] = pd.read_json(io.BytesIO(content), lines=True)
+#                     except Exception:
+#                         pass
+#             elif lower.endswith(".xlsx") or lower.endswith(".xls"):
+#                 try:
+#                     dfs[filename] = pd.read_excel(io.BytesIO(content))
+#                 except Exception:
+#                     pass
+#         except Exception:
+#             continue
+#     return raw, dfs
+
+# # ------------------ Question Parsing ------------------ #
+# @dataclass
+# class ParsedQuestions:
+#     mode: str
+#     items: List[str]
+
+# def parse_questions_text(qtext: str) -> ParsedQuestions:
+#     mode = "array" if "respond with a json array" in qtext.lower() else "object" if "respond with a json object" in qtext.lower() else "array"
+#     lines = [l.strip() for l in qtext.splitlines() if l.strip()]
+#     items: List[str] = []
+#     for l in lines:
+#         if l.lstrip().startswith(("-", "*")) or l.lstrip()[0:2].strip().isdigit():
+#             cleaned = l.lstrip("-*0123456789. ").strip()
+#             items.append(cleaned)
+#         else:
+#             if l.endswith("?"):
+#                 items.append(l)
+#     if not items:
+#         items = [qtext.strip()]
+#     return ParsedQuestions(mode=mode, items=items)
+
+# # ------------------ Main API Handler ------------------ #
+# @app.post("/api/", response_class=PlainTextResponse)
+# async def api_handler(request: Request, files: List[UploadFile] = File([])):
+#     deadline = Deadline(REQUEST_DEADLINE_SECONDS)
+
+#     async def _process() -> Any:
+#         qtext: Optional[str] = None
+#         other_uploads: List[UploadFile] = []
+
+#         for f in files:
+#             fname = (f.filename or "").strip()
+#             if fname.lower() == "questions.txt":
+#                 try:
+#                     qtext = (await f.read()).decode("utf-8", errors="replace")
+#                 except Exception:
+#                     qtext = ""
+#             else:
+#                 other_uploads.append(f)
+
+#         if not qtext:
+#             form = await request.form()
+#             for key, val in form.multi_items():
+#                 if key.lower() in ("questions.txt", "questions"):
+#                     if isinstance(val, UploadFile):
+#                         qtext = (await val.read()).decode("utf-8", errors="replace")
+#                     else:
+#                         qtext = str(val)
+#                     break
+
+#         if not qtext:
+#             return JSONResponse(content={"error": "questions.txt missing"}, status_code=400)
+
+#         parsed = parse_questions_text(qtext)
+#         raw_map, dfs_map = await load_uploaded_files(other_uploads)
+
+#         # ------------------ Phase 2: Sample Weather Analysis ------------------ #
+#         if "sample-weather.csv" in dfs_map:
+#             df = dfs_map["sample-weather.csv"]
+#             required_columns = ["temperature_c", "precipitation_mm", "date"]
+#             missing_cols = [c for c in required_columns if c not in df.columns]
+#             if missing_cols:
+#                 raise HTTPException(status_code=500, detail=f"Missing columns in CSV: {missing_cols}")
+#             try:
+#                 avg_temp = round(df["temperature_c"].mean(), 3)
+#                 min_temp = int(df["temperature_c"].min())
+#                 avg_precip = round(df["precipitation_mm"].mean(), 3)
+#                 max_precip_idx = df["precipitation_mm"].idxmax()
+#                 max_precip_date = str(df.loc[max_precip_idx, "date"])
+#                 corr = round(df["temperature_c"].corr(df["precipitation_mm"]), 10)
+
+#                 # Base64 charts
+#                 temp_line_chart = plot_scatter_regression(
+#                     np.arange(len(df)), df["temperature_c"].to_numpy(),
+#                     xlabel="Index", ylabel="Temperature (°C)", title="Temperature Trend"
+#                 )
+#                 precip_histogram = plot_scatter_regression(
+#                     np.arange(len(df)), df["precipitation_mm"].to_numpy(),
+#                     xlabel="Index", ylabel="Precipitation (mm)", title="Precipitation Histogram"
+#                 )
+
+#                 analysis_result = {
+#                     "average_temp_c": avg_temp,
+#                     "min_temp_c": min_temp,
+#                     "average_precip_mm": avg_precip,
+#                     "max_precip_date": max_precip_date,
+#                     "temp_precip_correlation": corr,
+#                     "temp_line_chart": temp_line_chart,
+#                     "precip_histogram": precip_histogram
+#                 }
+#                 return JSONResponse(content=analysis_result)
+#             except Exception as e:
+#                 raise HTTPException(status_code=500, detail=str(e))
+
+#         # Fallback pipeline
+#         return {"message": "Fallback processing pipeline (existing logic)"}
+
+#     try:
+#         return await asyncio.wait_for(_process(), timeout=deadline.remaining())
+#     except asyncio.TimeoutError:
+#         return PlainTextResponse(content=dumps_json([None, "", float("nan"), ""]), media_type="application/json", status_code=504)
+#     except Exception as e:
+#         return PlainTextResponse(content=dumps_json({"error": str(e)}), media_type="application/json", status_code=500)
+
+# # ------------------ Network Analysis Endpoint (NEW) ------------------ #
+# class AnalyzeRequest(BaseModel):
+#     file_path: str  # Path to CSV file
+
+# def plot_network_graph(G: nx.Graph) -> str:
+#     fig = plt.figure(figsize=(4, 4), dpi=100)
+#     nx.draw(G, with_labels=True, node_color='lightblue', edge_color='gray', node_size=500, font_size=8)
+#     bio = io.BytesIO()
+#     fig.savefig(bio, format='png', bbox_inches='tight', pad_inches=0.1)
+#     plt.close(fig)
+#     data = bio.getvalue()
+#     if len(data) > MAX_PLOT_BYTES:
+#         return "data:image/png;base64," + base64.b64encode(data[:MAX_PLOT_BYTES]).decode()
+#     return "data:image/png;base64," + base64.b64encode(data).decode()
+
+# def plot_degree_histogram(G: nx.Graph) -> str:
+#     fig = plt.figure(figsize=(4, 3), dpi=100)
+#     degrees = [d for _, d in G.degree()]
+#     plt.hist(degrees, bins=range(max(degrees)+2), color='lightgreen', edgecolor='black')
+#     plt.xlabel("Degree")
+#     plt.ylabel("Frequency")
+#     bio = io.BytesIO()
+#     fig.savefig(bio, format='png', bbox_inches='tight', pad_inches=0.1)
+#     plt.close(fig)
+#     data = bio.getvalue()
+#     if len(data) > MAX_PLOT_BYTES:
+#         return "data:image/png;base64," + base64.b64encode(data[:MAX_PLOT_BYTES]).decode()
+#     return "data:image/png;base64," + base64.b64encode(data).decode()
+
+# @app.post("/analyze")
+# async def analyze_network(req: AnalyzeRequest):
+#     if not os.path.exists(req.file_path):
+#         raise HTTPException(status_code=400, detail=f"File not found: {req.file_path}")
+#     try:
+#         df = pd.read_csv(req.file_path)
+#         edges = list(df.itertuples(index=False, name=None))
+#         G = nx.Graph()
+#         G.add_edges_from(edges)
+
+#         edge_count = G.number_of_edges()
+#         highest_degree_node = max(G.degree, key=lambda x: x[1])[0]
+#         average_degree = round(sum(dict(G.degree()).values()) / G.number_of_nodes(), 1)
+#         density = round(nx.density(G), 1)
+#         shortest_path_alice_eve = nx.shortest_path_length(G, source="Alice", target="Eve")
+
+#         return {
+#             "edge_count": edge_count,
+#             "highest_degree_node": highest_degree_node,
+#             "average_degree": average_degree,
+#             "density": density,
+#             "shortest_path_alice_eve": shortest_path_alice_eve,
+#             "network_graph": plot_network_graph(G),
+#             "degree_histogram": plot_degree_histogram(G)
+#         }
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=str(e))
+
+# # ------------------ Health endpoint ------------------ #
+# @app.get("/health")
+# async def health():
+#     return {"ok": True}
 
 
 
