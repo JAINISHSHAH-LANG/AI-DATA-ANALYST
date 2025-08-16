@@ -1,62 +1,138 @@
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse
 import pandas as pd
+import os
 
 app = FastAPI()
 
-# Home page with upload form
-@app.get("/", response_class=HTMLResponse)
-async def main():
-    content = """
-    <html>
-        <head>
-            <title>AI Data Analyst - Upload</title>
-        </head>
-        <body style="font-family: Arial; margin: 50px;">
-            <h2>Upload your CSV file</h2>
-            <form action="/upload" enctype="multipart/form-data" method="post">
-                <input name="file" type="file" accept=".csv">
-                <input type="submit" value="Upload">
-            </form>
-        </body>
-    </html>
-    """
-    return content
+UPLOAD_FOLDER = "uploads"
+CLEANED_FOLDER = "cleaned"
 
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(CLEANED_FOLDER, exist_ok=True)
 
-# Upload + Preview
-@app.post("/upload", response_class=HTMLResponse)
-async def upload(file: UploadFile = File(...)):
+@app.get("/")
+def read_root():
+    return {"message": "AI Data Analyst API is running 🚀"}
+
+# Upload + analyze + save cleaned dataset
+@app.post("/upload/")
+async def upload_file(file: UploadFile = File(...)):
+    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    
+    contents = await file.read()
+    with open(file_path, "wb") as f:
+        f.write(contents)
+
     try:
-        df = pd.read_csv(file.file)
+        df = pd.read_csv(file_path)
 
-        # Convert first 10 rows into HTML table
-        table_html = df.head(10).to_html(classes="table", border=1, index=False)
+        # Basic cleaning: fill missing numeric with mean, categorical with mode
+        for col in df.columns:
+            if df[col].dtype in ["int64", "float64"]:
+                df[col].fillna(df[col].mean(), inplace=True)
+            else:
+                df[col].fillna(df[col].mode()[0] if not df[col].mode().empty else "Unknown", inplace=True)
 
-        content = f"""
-        <html>
-            <head>
-                <title>Preview - {file.filename}</title>
-                <style>
-                    body {{ font-family: Arial; margin: 50px; }}
-                    table {{ border-collapse: collapse; width: 80%; }}
-                    th, td {{ border: 1px solid #ddd; padding: 8px; text-align: center; }}
-                    th {{ background-color: #f2f2f2; }}
-                </style>
-            </head>
-            <body>
-                <h2>Uploaded File: {file.filename}</h2>
-                <h3>Preview (first 10 rows)</h3>
-                {table_html}
-                <br>
-                <a href="/">Upload another file</a>
-            </body>
-        </html>
-        """
-        return content
+        # Save cleaned version
+        cleaned_filename = f"cleaned_{file.filename}"
+        cleaned_path = os.path.join(CLEANED_FOLDER, cleaned_filename)
+        df.to_csv(cleaned_path, index=False)
+
+        # Analysis
+        info = {
+            "filename": file.filename,
+            "rows": len(df),
+            "columns": list(df.columns),
+            "data_types": df.dtypes.astype(str).to_dict(),
+            "missing_values_after_cleaning": df.isnull().sum().to_dict(),
+            "summary_statistics": df.describe(include="all").to_dict(),
+            "cleaned_file_download": f"/download/{cleaned_filename}"
+        }
+
+        return info
 
     except Exception as e:
-        return f"<h3>Error: {str(e)}</h3><br><a href='/'>Go back</a>"
+        return {"error": str(e)}
+
+# Download endpoint
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    file_path = os.path.join(CLEANED_FOLDER, filename)
+    if os.path.exists(file_path):
+        return FileResponse(file_path, filename=filename, media_type="text/csv")
+    return {"error": "File not found"}
+
+
+
+
+
+
+
+
+
+
+
+
+# from fastapi import FastAPI, UploadFile, File
+# from fastapi.responses import HTMLResponse
+# import pandas as pd
+
+# app = FastAPI()
+
+# # Home page with upload form
+# @app.get("/", response_class=HTMLResponse)
+# async def main():
+#     content = """
+#     <html>
+#         <head>
+#             <title>AI Data Analyst - Upload</title>
+#         </head>
+#         <body style="font-family: Arial; margin: 50px;">
+#             <h2>Upload your CSV file</h2>
+#             <form action="/upload" enctype="multipart/form-data" method="post">
+#                 <input name="file" type="file" accept=".csv">
+#                 <input type="submit" value="Upload">
+#             </form>
+#         </body>
+#     </html>
+#     """
+#     return content
+
+
+# # Upload + Preview
+# @app.post("/upload", response_class=HTMLResponse)
+# async def upload(file: UploadFile = File(...)):
+#     try:
+#         df = pd.read_csv(file.file)
+
+#         # Convert first 10 rows into HTML table
+#         table_html = df.head(10).to_html(classes="table", border=1, index=False)
+
+#         content = f"""
+#         <html>
+#             <head>
+#                 <title>Preview - {file.filename}</title>
+#                 <style>
+#                     body {{ font-family: Arial; margin: 50px; }}
+#                     table {{ border-collapse: collapse; width: 80%; }}
+#                     th, td {{ border: 1px solid #ddd; padding: 8px; text-align: center; }}
+#                     th {{ background-color: #f2f2f2; }}
+#                 </style>
+#             </head>
+#             <body>
+#                 <h2>Uploaded File: {file.filename}</h2>
+#                 <h3>Preview (first 10 rows)</h3>
+#                 {table_html}
+#                 <br>
+#                 <a href="/">Upload another file</a>
+#             </body>
+#         </html>
+#         """
+#         return content
+
+#     except Exception as e:
+#         return f"<h3>Error: {str(e)}</h3><br><a href='/'>Go back</a>"
 
 
 
