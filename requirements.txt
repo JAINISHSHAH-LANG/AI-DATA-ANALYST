@@ -1,14 +1,30 @@
-fastapi==0.111.0
-uvicorn==0.30.1
-python-multipart==0.0.9
-pydantic==2.8.2
-pandas==2.2.2
-numpy==1.26.4
-matplotlib==3.9.0
-beautifulsoup4==4.12.3
-requests==2.32.3
-lxml==5.2.2
-duckdb==1.1.3
-pyarrow==17.0.0
-orjson==3.10.7
-httpx==0.27.0
+# Core API framework
+fastapi
+uvicorn
+
+# Data handling & analysis
+pandas
+numpy
+duckdb
+
+# Visualization
+matplotlib
+Pillow   # for image encoding (WebP/PNG)
+
+# Web scraping / parsing
+requests
+beautifulsoup4
+lxml
+
+# JSON & serialization
+orjson
+
+# HTTP client for LLM API calls
+httpx
+
+# File upload parsing
+python-multipart
+
+# Validation
+pydantic
+
