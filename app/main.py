@@ -1,139 +1,223 @@
-# app/main.py
-import os
-import io
-import json
-import base64
-import time
-import asyncio
-from typing import List, Dict, Any
-from dataclasses import dataclass
-
-import pandas as pd
-import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-import networkx as nx
-
-from fastapi import FastAPI, UploadFile, File, HTTPException
-from fastapi.responses import JSONResponse
+# main.py
+from fastapi import FastAPI
 from pydantic import BaseModel
+import networkx as nx
+import matplotlib.pyplot as plt
+import io, base64, pandas as pd
 
-# Configuration
-MAX_PLOT_BYTES = 100000
-REQUEST_DEADLINE_SECONDS = 170
+app = FastAPI()
 
-app = FastAPI(title="AI Data Analyst Agent")
-
-# ---------------- Utilities ---------------- #
-class Deadline:
-    def __init__(self, seconds: float):
-        self.start = time.time()
-        self.deadline = self.start + seconds
-    def remaining(self) -> float:
-        return max(0.0, self.deadline - time.time())
-
-def plot_to_base64(fig):
-    bio = io.BytesIO()
-    fig.savefig(bio, format="png", bbox_inches="tight")
-    plt.close(fig)
-    data = bio.getvalue()
-    if len(data) > MAX_PLOT_BYTES:
-        # resize by lowering DPI
-        bio = io.BytesIO()
-        fig.savefig(bio, format="png", dpi=50, bbox_inches="tight")
-        plt.close(fig)
-        data = bio.getvalue()
-    return "data:image/png;base64," + base64.b64encode(data).decode()
-
-def plot_network_graph(G: nx.Graph) -> str:
-    fig = plt.figure(figsize=(4,3))
-    nx.draw_networkx(G, with_labels=True, node_color='skyblue', edge_color='gray', node_size=500, font_size=10)
-    return plot_to_base64(fig)
-
-def plot_degree_histogram(G: nx.Graph) -> str:
-    degrees = [d for n,d in G.degree()]
-    fig = plt.figure(figsize=(4,3))
-    plt.hist(degrees, bins=range(min(degrees), max(degrees)+2))
-    plt.xlabel("Degree")
-    plt.ylabel("Frequency")
-    plt.title("Degree Histogram")
-    return plot_to_base64(fig)
-
-async def load_uploaded_files(files: List[UploadFile]) -> Dict[str, pd.DataFrame]:
-    dfs = {}
-    for f in files:
-        if f.filename.lower().endswith(".csv"):
-            content = await f.read()
-            dfs[f.filename] = pd.read_csv(io.BytesIO(content))
-    return dfs
-
-@dataclass
-class ParsedQuestions:
-    mode: str
-    items: List[str]
-
-def parse_questions_text(qtext: str) -> ParsedQuestions:
-    lines = [l.strip() for l in qtext.splitlines() if l.strip()]
-    items = [l.lstrip("-*0123456789. ").strip() for l in lines]
-    return ParsedQuestions(mode="array", items=items)
-
-# ---------------- API Endpoints ---------------- #
-
-@app.post("/api/")
-async def api_handler(files: List[UploadFile] = File(...)):
-    dfs_map = await load_uploaded_files(files)
-
-    # Get questions.txt
-    question_files = [f for f in files if f.filename.lower() == "questions.txt"]
-    if not question_files:
-        return JSONResponse(content={"error": "questions.txt missing"}, status_code=400)
-    
-    qtext = (await question_files[0].read()).decode("utf-8", errors="replace")
-    parsed = parse_questions_text(qtext)
-
-    return JSONResponse({
-        "parsed_questions": parsed.items,
-        "uploaded_files": list(dfs_map.keys())
-    })
-
-# ---------------- Analyze Endpoint ---------------- #
-class AnalyzeRequest(BaseModel):
+class FilePath(BaseModel):
     file_path: str
 
 @app.post("/analyze")
-async def analyze_network(req: AnalyzeRequest):
-    if not os.path.exists(req.file_path):
-        raise HTTPException(status_code=400, detail=f"File not found: {req.file_path}")
+def analyze(file: FilePath):
+    # Load edges
+    edges_df = pd.read_csv(file.file_path)
+    if edges_df.shape[1] < 2:
+        return {"error": "CSV must have at least two columns (source, target)"}
 
-    df = pd.read_csv(req.file_path)
-    edges = list(df.itertuples(index=False, name=None))
-    G = nx.Graph()
-    G.add_edges_from(edges)
+    # Build graph
+    G = nx.from_pandas_edgelist(edges_df, edges_df.columns[0], edges_df.columns[1])
 
+    # --- Network Metrics ---
     edge_count = G.number_of_edges()
-    highest_degree_node = max(G.degree, key=lambda x: x[1])[0]
-    average_degree = round(sum(dict(G.degree()).values()) / G.number_of_nodes(), 1)
-    density = round(nx.density(G), 1)
-    try:
-        shortest_path_alice_eve = nx.shortest_path_length(G, source="Alice", target="Eve")
-    except nx.NetworkXNoPath:
-        shortest_path_alice_eve = None
+    degree_dict = dict(G.degree())
+    highest_degree_node = max(degree_dict, key=degree_dict.get)
+    average_degree = sum(degree_dict.values()) / len(degree_dict)
+    density = nx.density(G)
 
-    return JSONResponse({
+    try:
+        shortest_path = nx.shortest_path(G, source="Alice", target="Eve")
+    except Exception:
+        shortest_path = None
+
+    # --- Plot network graph ---
+    plt.figure(figsize=(6, 4))
+    nx.draw(G, with_labels=True, node_color="lightblue", edge_color="gray", node_size=500)
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    buf.seek(0)
+    network_graph_b64 = base64.b64encode(buf.read()).decode("utf-8")
+    plt.close()
+
+    # --- Plot degree histogram ---
+    plt.figure(figsize=(6, 4))
+    plt.hist(list(degree_dict.values()), bins=range(1, max(degree_dict.values())+2), color="skyblue", edgecolor="black")
+    plt.xlabel("Degree")
+    plt.ylabel("Frequency")
+    plt.title("Degree Histogram")
+    buf = io.BytesIO()
+    plt.savefig(buf, format="png")
+    buf.seek(0)
+    degree_histogram_b64 = base64.b64encode(buf.read()).decode("utf-8")
+    plt.close()
+
+    return {
         "edge_count": edge_count,
         "highest_degree_node": highest_degree_node,
         "average_degree": average_degree,
         "density": density,
-        "shortest_path_alice_eve": shortest_path_alice_eve,
-        "network_graph": plot_network_graph(G),
-        "degree_histogram": plot_degree_histogram(G)
-    })
+        "shortest_path_alice_eve": shortest_path,
+        "network_graph": network_graph_b64,
+        "degree_histogram": degree_histogram_b64
+    }
 
-# ---------------- Health Check ---------------- #
-@app.get("/health")
-async def health():
-    return {"ok": True}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# # app/main.py
+# import os
+# import io
+# import json
+# import base64
+# import time
+# import asyncio
+# from typing import List, Dict, Any
+# from dataclasses import dataclass
+
+# import pandas as pd
+# import numpy as np
+# import matplotlib
+# matplotlib.use("Agg")
+# import matplotlib.pyplot as plt
+# import networkx as nx
+
+# from fastapi import FastAPI, UploadFile, File, HTTPException
+# from fastapi.responses import JSONResponse
+# from pydantic import BaseModel
+
+# # Configuration
+# MAX_PLOT_BYTES = 100000
+# REQUEST_DEADLINE_SECONDS = 170
+
+# app = FastAPI(title="AI Data Analyst Agent")
+
+# # ---------------- Utilities ---------------- #
+# class Deadline:
+#     def __init__(self, seconds: float):
+#         self.start = time.time()
+#         self.deadline = self.start + seconds
+#     def remaining(self) -> float:
+#         return max(0.0, self.deadline - time.time())
+
+# def plot_to_base64(fig):
+#     bio = io.BytesIO()
+#     fig.savefig(bio, format="png", bbox_inches="tight")
+#     plt.close(fig)
+#     data = bio.getvalue()
+#     if len(data) > MAX_PLOT_BYTES:
+#         # resize by lowering DPI
+#         bio = io.BytesIO()
+#         fig.savefig(bio, format="png", dpi=50, bbox_inches="tight")
+#         plt.close(fig)
+#         data = bio.getvalue()
+#     return "data:image/png;base64," + base64.b64encode(data).decode()
+
+# def plot_network_graph(G: nx.Graph) -> str:
+#     fig = plt.figure(figsize=(4,3))
+#     nx.draw_networkx(G, with_labels=True, node_color='skyblue', edge_color='gray', node_size=500, font_size=10)
+#     return plot_to_base64(fig)
+
+# def plot_degree_histogram(G: nx.Graph) -> str:
+#     degrees = [d for n,d in G.degree()]
+#     fig = plt.figure(figsize=(4,3))
+#     plt.hist(degrees, bins=range(min(degrees), max(degrees)+2))
+#     plt.xlabel("Degree")
+#     plt.ylabel("Frequency")
+#     plt.title("Degree Histogram")
+#     return plot_to_base64(fig)
+
+# async def load_uploaded_files(files: List[UploadFile]) -> Dict[str, pd.DataFrame]:
+#     dfs = {}
+#     for f in files:
+#         if f.filename.lower().endswith(".csv"):
+#             content = await f.read()
+#             dfs[f.filename] = pd.read_csv(io.BytesIO(content))
+#     return dfs
+
+# @dataclass
+# class ParsedQuestions:
+#     mode: str
+#     items: List[str]
+
+# def parse_questions_text(qtext: str) -> ParsedQuestions:
+#     lines = [l.strip() for l in qtext.splitlines() if l.strip()]
+#     items = [l.lstrip("-*0123456789. ").strip() for l in lines]
+#     return ParsedQuestions(mode="array", items=items)
+
+# # ---------------- API Endpoints ---------------- #
+
+# @app.post("/api/")
+# async def api_handler(files: List[UploadFile] = File(...)):
+#     dfs_map = await load_uploaded_files(files)
+
+#     # Get questions.txt
+#     question_files = [f for f in files if f.filename.lower() == "questions.txt"]
+#     if not question_files:
+#         return JSONResponse(content={"error": "questions.txt missing"}, status_code=400)
+    
+#     qtext = (await question_files[0].read()).decode("utf-8", errors="replace")
+#     parsed = parse_questions_text(qtext)
+
+#     return JSONResponse({
+#         "parsed_questions": parsed.items,
+#         "uploaded_files": list(dfs_map.keys())
+#     })
+
+# # ---------------- Analyze Endpoint ---------------- #
+# class AnalyzeRequest(BaseModel):
+#     file_path: str
+
+# @app.post("/analyze")
+# async def analyze_network(req: AnalyzeRequest):
+#     if not os.path.exists(req.file_path):
+#         raise HTTPException(status_code=400, detail=f"File not found: {req.file_path}")
+
+#     df = pd.read_csv(req.file_path)
+#     edges = list(df.itertuples(index=False, name=None))
+#     G = nx.Graph()
+#     G.add_edges_from(edges)
+
+#     edge_count = G.number_of_edges()
+#     highest_degree_node = max(G.degree, key=lambda x: x[1])[0]
+#     average_degree = round(sum(dict(G.degree()).values()) / G.number_of_nodes(), 1)
+#     density = round(nx.density(G), 1)
+#     try:
+#         shortest_path_alice_eve = nx.shortest_path_length(G, source="Alice", target="Eve")
+#     except nx.NetworkXNoPath:
+#         shortest_path_alice_eve = None
+
+#     return JSONResponse({
+#         "edge_count": edge_count,
+#         "highest_degree_node": highest_degree_node,
+#         "average_degree": average_degree,
+#         "density": density,
+#         "shortest_path_alice_eve": shortest_path_alice_eve,
+#         "network_graph": plot_network_graph(G),
+#         "degree_histogram": plot_degree_histogram(G)
+#     })
+
+# # ---------------- Health Check ---------------- #
+# @app.get("/health")
+# async def health():
+#     return {"ok": True}
 
 
 
