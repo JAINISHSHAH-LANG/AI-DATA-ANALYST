@@ -1,9 +1,15 @@
-from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+# main.py
+
+from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse
 import pandas as pd
+import networkx as nx
+import matplotlib.pyplot as plt
+from io import BytesIO
+import base64
 import os
 import uuid
-from typing import Dict
+from typing import Dict, Optional
 
 app = FastAPI(title="AI Data Analyst API 🚀")
 
@@ -12,14 +18,99 @@ CLEANED_FOLDER = "cleaned"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(CLEANED_FOLDER, exist_ok=True)
 
-# In-memory task store: tracks progress and result
+# In-memory task store for background jobs
 task_store: Dict[str, Dict] = {}
 
 @app.get("/")
 def read_root():
     return {"message": "AI Data Analyst API is running 🚀"}
 
-# Background task: clean data + generate analysis
+
+# ------------------------
+# Helper Functions
+# ------------------------
+def encode_plot_to_base64(plt_obj):
+    buf = BytesIO()
+    plt_obj.savefig(buf, format="png", bbox_inches="tight")
+    buf.seek(0)
+    b64_img = "data:image/png;base64," + base64.b64encode(buf.read()).decode()
+    plt_obj.close()
+    return b64_img
+
+def compute_network_metrics(df: pd.DataFrame):
+    if "source" not in df.columns or "target" not in df.columns:
+        raise ValueError("CSV must contain 'source' and 'target' columns")
+    
+    G = nx.from_pandas_edgelist(df, source="source", target="target")
+    edge_count = G.number_of_edges()
+    degrees = dict(G.degree())
+    highest_degree_node = max(degrees, key=degrees.get)
+    average_degree = sum(degrees.values()) / len(degrees) if degrees else 0
+    density = nx.density(G)
+    
+    # Shortest path from Alice to Eve if exists
+    try:
+        shortest_path_alice_eve = nx.shortest_path_length(G, source="Alice", target="Eve")
+    except nx.NetworkXNoPath:
+        shortest_path_alice_eve = None
+    except nx.NodeNotFound:
+        shortest_path_alice_eve = None
+
+    # Plots
+    plt.figure(figsize=(4, 4))
+    nx.draw_networkx(G, with_labels=True, node_color="skyblue", edge_color="gray", node_size=500, font_size=10)
+    network_graph_b64 = encode_plot_to_base64(plt)
+
+    plt.figure(figsize=(4, 3))
+    plt.hist(list(degrees.values()), bins=10, color="skyblue", edgecolor="black")
+    plt.xlabel("Degree")
+    plt.ylabel("Count")
+    plt.title("Degree Histogram")
+    degree_histogram_b64 = encode_plot_to_base64(plt)
+
+    return {
+        "edge_count": edge_count,
+        "highest_degree_node": highest_degree_node,
+        "average_degree": average_degree,
+        "density": density,
+        "shortest_path_alice_eve": shortest_path_alice_eve,
+        "network_graph": network_graph_b64,
+        "degree_histogram": degree_histogram_b64
+    }
+
+
+# ------------------------
+# /analyze Endpoint
+# ------------------------
+@app.post("/analyze")
+async def analyze(file: Optional[UploadFile] = File(None), file_path: Optional[str] = None):
+    # Determine CSV source
+    if not file and not file_path:
+        raise HTTPException(status_code=400, detail="No file or file_path provided")
+
+    try:
+        if file:
+            contents = await file.read()
+            df = pd.read_csv(BytesIO(contents))
+        else:
+            if not os.path.exists(file_path):
+                raise HTTPException(status_code=400, detail=f"File path '{file_path}' does not exist")
+            df = pd.read_csv(file_path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read CSV: {e}")
+
+    # Compute metrics and plots
+    try:
+        result = compute_network_metrics(df)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to compute network metrics: {e}")
+
+    return result
+
+
+# ------------------------
+# /upload Endpoint (Background Cleaning + Analysis)
+# ------------------------
 def clean_and_analyze(file_path: str, cleaned_path: str, task_id: str, filename: str):
     try:
         df = pd.read_csv(file_path)
@@ -31,14 +122,12 @@ def clean_and_analyze(file_path: str, cleaned_path: str, task_id: str, filename:
                 df[col].fillna(df[col].mean(), inplace=True)
             else:
                 df[col].fillna(df[col].mode()[0] if not df[col].mode().empty else "Unknown", inplace=True)
-            # Update progress
             task_store[task_id]["progress"] = f"{int((idx / total_cols) * 50)}%"
 
-        # Save cleaned file
         df.to_csv(cleaned_path, index=False)
         task_store[task_id]["progress"] = "50%"
 
-        # Generate analysis
+        # Generate summary analysis
         analysis = {
             "filename": filename,
             "rows": len(df),
@@ -55,7 +144,7 @@ def clean_and_analyze(file_path: str, cleaned_path: str, task_id: str, filename:
         task_store[task_id]["progress"] = f"Error: {str(e)}"
         task_store[task_id]["result"] = None
 
-# Upload endpoint
+
 @app.post("/upload/")
 async def upload_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
     task_id = str(uuid.uuid4())
@@ -67,29 +156,130 @@ async def upload_file(file: UploadFile = File(...), background_tasks: Background
     with open(file_path, "wb") as f:
         f.write(contents)
 
-    # Initialize task store
     task_store[task_id] = {"progress": "0%", "result": None}
 
-    # Run background cleaning + analysis
     background_tasks.add_task(clean_and_analyze, file_path, cleaned_path, task_id, filename)
 
     return {"task_id": task_id, "message": "File uploaded successfully. Cleaning and analysis started."}
 
-# Progress + result endpoint
+
 @app.get("/progress/{task_id}")
 def check_progress(task_id: str):
     task = task_store.get(task_id)
     if not task:
-        return {"error": "Invalid task ID"}
+        raise HTTPException(status_code=400, detail="Invalid task ID")
     return {"task_id": task_id, "progress": task["progress"], "result": task["result"]}
 
-# Download endpoint
+
 @app.get("/download/{filename}")
 async def download_file(filename: str):
     file_path = os.path.join(CLEANED_FOLDER, filename)
     if os.path.exists(file_path):
         return FileResponse(file_path, filename=filename, media_type="text/csv")
-    return {"error": "File not found"}
+    raise HTTPException(status_code=404, detail="File not found")
+
+
+
+
+
+
+
+
+
+
+
+# from fastapi import FastAPI, UploadFile, File, BackgroundTasks
+# from fastapi.responses import FileResponse
+# import pandas as pd
+# import os
+# import uuid
+# from typing import Dict
+
+# app = FastAPI(title="AI Data Analyst API 🚀")
+
+# UPLOAD_FOLDER = "uploads"
+# CLEANED_FOLDER = "cleaned"
+# os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+# os.makedirs(CLEANED_FOLDER, exist_ok=True)
+
+# # In-memory task store: tracks progress and result
+# task_store: Dict[str, Dict] = {}
+
+# @app.get("/")
+# def read_root():
+#     return {"message": "AI Data Analyst API is running 🚀"}
+
+# # Background task: clean data + generate analysis
+# def clean_and_analyze(file_path: str, cleaned_path: str, task_id: str, filename: str):
+#     try:
+#         df = pd.read_csv(file_path)
+#         total_cols = len(df.columns)
+
+#         # Cleaning
+#         for idx, col in enumerate(df.columns, start=1):
+#             if df[col].dtype in ["int64", "float64"]:
+#                 df[col].fillna(df[col].mean(), inplace=True)
+#             else:
+#                 df[col].fillna(df[col].mode()[0] if not df[col].mode().empty else "Unknown", inplace=True)
+#             # Update progress
+#             task_store[task_id]["progress"] = f"{int((idx / total_cols) * 50)}%"
+
+#         # Save cleaned file
+#         df.to_csv(cleaned_path, index=False)
+#         task_store[task_id]["progress"] = "50%"
+
+#         # Generate analysis
+#         analysis = {
+#             "filename": filename,
+#             "rows": len(df),
+#             "columns": list(df.columns),
+#             "data_types": df.dtypes.astype(str).to_dict(),
+#             "missing_values_after_cleaning": df.isnull().sum().to_dict(),
+#             "summary_statistics": df.describe(include="all").to_dict(),
+#             "cleaned_file_download": f"/download/{os.path.basename(cleaned_path)}"
+#         }
+
+#         task_store[task_id]["progress"] = "100%"
+#         task_store[task_id]["result"] = analysis
+#     except Exception as e:
+#         task_store[task_id]["progress"] = f"Error: {str(e)}"
+#         task_store[task_id]["result"] = None
+
+# # Upload endpoint
+# @app.post("/upload/")
+# async def upload_file(file: UploadFile = File(...), background_tasks: BackgroundTasks = None):
+#     task_id = str(uuid.uuid4())
+#     filename = file.filename
+#     file_path = os.path.join(UPLOAD_FOLDER, f"{task_id}_{filename}")
+#     cleaned_path = os.path.join(CLEANED_FOLDER, f"cleaned_{filename}")
+
+#     contents = await file.read()
+#     with open(file_path, "wb") as f:
+#         f.write(contents)
+
+#     # Initialize task store
+#     task_store[task_id] = {"progress": "0%", "result": None}
+
+#     # Run background cleaning + analysis
+#     background_tasks.add_task(clean_and_analyze, file_path, cleaned_path, task_id, filename)
+
+#     return {"task_id": task_id, "message": "File uploaded successfully. Cleaning and analysis started."}
+
+# # Progress + result endpoint
+# @app.get("/progress/{task_id}")
+# def check_progress(task_id: str):
+#     task = task_store.get(task_id)
+#     if not task:
+#         return {"error": "Invalid task ID"}
+#     return {"task_id": task_id, "progress": task["progress"], "result": task["result"]}
+
+# # Download endpoint
+# @app.get("/download/{filename}")
+# async def download_file(filename: str):
+#     file_path = os.path.join(CLEANED_FOLDER, filename)
+#     if os.path.exists(file_path):
+#         return FileResponse(file_path, filename=filename, media_type="text/csv")
+#     return {"error": "File not found"}
 
 
 
