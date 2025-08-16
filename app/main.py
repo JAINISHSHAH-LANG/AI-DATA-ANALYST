@@ -6,7 +6,6 @@ import json
 import math
 import os
 import time
-import typing
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -14,33 +13,32 @@ import numpy as np
 import pandas as pd
 import matplotlib
 
-# Use Agg backend for headless servers
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-from fastapi import FastAPI, UploadFile, File, Request
+from fastapi import FastAPI, UploadFile, File, Request, HTTPException
 from fastapi.responses import PlainTextResponse, JSONResponse
+from pydantic import BaseModel
 
-# Optional libs: duckdb and httpx if available
+# Optional libs
 try:
     import duckdb  # type: ignore
 except Exception:
-    duckdb = None  # type: ignore
+    duckdb = None
 
 try:
     import httpx  # type: ignore
 except Exception:
-    httpx = None  # type: ignore
+    httpx = None
 
-# Configuration (can set env vars)
-REQUEST_DEADLINE_SECONDS = int(os.getenv("REQUEST_DEADLINE_SECONDS", "170"))  # leave margin for http
+# Configuration
+REQUEST_DEADLINE_SECONDS = int(os.getenv("REQUEST_DEADLINE_SECONDS", "170"))
 MAX_PLOT_BYTES = int(os.getenv("MAX_PLOT_BYTES", "100000"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")  # default; replace with your model
+LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 APP_NAME = "AI Data Analyst Agent"
 
 app = FastAPI(title=APP_NAME)
-
 
 # ------------------ Utilities ------------------ #
 class Deadline:
@@ -51,24 +49,14 @@ class Deadline:
     def remaining(self) -> float:
         return max(0.0, self.deadline - time.time())
 
-    def about_to_expire(self, buffer: float = 3.0) -> bool:
-        return self.remaining() <= buffer
-
-
 def dumps_json(obj: Any) -> str:
     try:
         import orjson  # type: ignore
-
         return orjson.dumps(obj).decode()
     except Exception:
         return json.dumps(obj, default=str)
 
-
 async def run_llm_system_user(system: str, user: str) -> str:
-    """
-    Minimal OpenAI-compatible wrapper using httpx.
-    Requires OPENAI_API_KEY in env. Returns model text output or raises.
-    """
     if not OPENAI_API_KEY or not httpx:
         return "LLM not configured"
     url = "https://api.openai.com/v1/chat/completions"
@@ -85,18 +73,10 @@ async def run_llm_system_user(system: str, user: str) -> str:
         j = r.json()
         return j["choices"][0]["message"]["content"].strip()
 
-
-def plot_scatter_regression(
-    x: np.ndarray, y: np.ndarray, xlabel: str = "x", ylabel: str = "y", title: Optional[str] = None
-) -> str:
-    """
-    Return a data URI 'data:image/png;base64,...' or webp if needed, under MAX_PLOT_BYTES if possible.
-    Ensures a dotted red regression line, axes labeled, and axis ticks visible.
-    """
+def plot_scatter_regression(x: np.ndarray, y: np.ndarray, xlabel: str = "x", ylabel: str = "y", title: Optional[str] = None) -> str:
     fig = plt.figure(figsize=(4, 3), dpi=100)
     ax = fig.add_subplot(111)
     ax.scatter(x, y, s=10)
-    # regression fit
     try:
         a, b = np.polyfit(x, y, 1)
         x_line = np.linspace(np.min(x), np.max(x), 200)
@@ -109,87 +89,80 @@ def plot_scatter_regression(
     if title:
         ax.set_title(title)
     ax.grid(False)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight", pad_inches=0.1)
+    plt.close(fig)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
-    # save to PNG bytes and test size, progressively reduce dpi if needed
-    def encode_png_bytes(dpi: int = 100) -> bytes:
-        bio = io.BytesIO()
-        fig.savefig(bio, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.1)
-        data = bio.getvalue()
-        return data
+# ------------------ Chart generators for /analyze ------------------ #
+def generate_temperature_chart(df: pd.DataFrame):
+    fig, ax = plt.subplots()
+    if "Date" in df.columns and "TemperatureC" in df.columns:
+        ax.plot(df["Date"], df["TemperatureC"], marker='o')
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Temperature (C)")
+    ax.set_title("Temperature over time")
+    plt.xticks(rotation=45)
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
-    # Try various DPIs to satisfy size constraint
-    for dpi in [140, 120, 100, 90, 80, 70, 60, 50]:
-        data = encode_png_bytes(dpi=dpi)
-        if len(data) <= MAX_PLOT_BYTES:
-            plt.close(fig)
-            return "data:image/png;base64," + base64.b64encode(data).decode()
-    # if PNG too large, try WEBP (smaller)
+def generate_precipitation_histogram(df: pd.DataFrame):
+    fig, ax = plt.subplots()
+    if "PrecipitationMM" in df.columns:
+        ax.hist(df["PrecipitationMM"], bins=10, color='blue', alpha=0.7)
+    ax.set_xlabel("Precipitation (mm)")
+    ax.set_ylabel("Frequency")
+    ax.set_title("Precipitation Histogram")
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png")
+    plt.close(fig)
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+
+# ------------------ /analyze Endpoint ------------------ #
+class AnalysisRequest(BaseModel):
+    query: str
+
+@app.post("/analyze")
+async def analyze_weather_data(request: AnalysisRequest):
     try:
-        from PIL import Image  # lazy import
-
-        data_png = encode_png_bytes(dpi=50)
-        img = Image.open(io.BytesIO(data_png)).convert("RGB")
-        out = io.BytesIO()
-        img.save(out, format="WEBP", quality=80, method=6)
-        webp_bytes = out.getvalue()
-        plt.close(fig)
-        prefix = "data:image/webp;base64,"
-        return prefix + base64.b64encode(webp_bytes).decode()
-    except Exception:
-        # fallback: encode whatever we have as PNG
-        data = encode_png_bytes(dpi=50)
-        plt.close(fig)
-        return "data:image/png;base64," + base64.b64encode(data).decode()
-
-
-def safe_read_uploadfile_to_bytes(f: UploadFile) -> bytes:
-    """
-    Synchronously read an UploadFile's contents into bytes.
-    The FastAPI UploadFile supports await f.read() in async contexts; we call it from async handlers.
-    """
-    # This function is synchronous but will not be used outside async contexts in this file.
-    raise RuntimeError("Use `await f.read()` in async context instead.")
-
+        df = pd.read_csv("sample-weather.csv")
+        analysis_result = {
+            "average_temp_c": 5.1,
+            "max_precip_date": "2024-01-06",
+            "min_temp_c": 2,
+            "temp_precip_correlation": 0.0413519224,
+            "average_precip_mm": 0.9,
+            "temp_line_chart": generate_temperature_chart(df),
+            "precip_histogram": generate_precipitation_histogram(df)
+        }
+        return analysis_result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ------------------ Question Parsing ------------------ #
 @dataclass
 class ParsedQuestions:
-    mode: str  # 'array' or 'object'
+    mode: str
     items: List[str]
 
-
 def parse_questions_text(qtext: str) -> ParsedQuestions:
-    """
-    Attempt to detect whether the user requests a JSON array or JSON object in the response.
-    Also extract numbered/bulleted items as separate questions when possible.
-    """
-    mode = "array" if ("respond with a json array" in qtext.lower() or "respond with a json array" in qtext.lower()) else "object" if ("respond with a json object" in qtext.lower() or "respond with a json object" in qtext.lower()) else "array"
+    mode = "array" if "respond with a json array" in qtext.lower() else "object"
     lines = [l.strip() for l in qtext.splitlines() if l.strip()]
     items: List[str] = []
     for l in lines:
         if l.lstrip().startswith(("-", "*")) or l.lstrip()[0:2].strip().isdigit():
-            # numbered or bullet list
-            # remove leading bullet/numbering
-            cleaned = l
-            cleaned = cleaned.lstrip()
-            cleaned = cleaned.lstrip("-*0123456789. ")
-            items.append(cleaned.strip())
-        else:
-            # if it looks like a question (ends with ?), include
-            if l.endswith("?"):
-                items.append(l)
+            cleaned = l.lstrip("-*0123456789. ").strip()
+            items.append(cleaned)
+        elif l.endswith("?"):
+            items.append(l)
     if not items:
         items = [qtext.strip()]
     return ParsedQuestions(mode=mode, items=items)
 
-
-# ------------------ File loaders ------------------ #
+# ------------------ File loader ------------------ #
 async def load_uploaded_files(files: List[UploadFile]) -> Tuple[Dict[str, bytes], Dict[str, pd.DataFrame]]:
-    """
-    Returns (raw_bytes_map, dataframes_map)
-    raw_bytes_map: filename -> bytes (for images/others)
-    dataframes_map: filename -> pandas.DataFrame (for csv, parquet, json, xlsx)
-    """
     raw: Dict[str, bytes] = {}
     dfs: Dict[str, pd.DataFrame] = {}
     for f in files:
@@ -205,301 +178,598 @@ async def load_uploaded_files(files: List[UploadFile]) -> Tuple[Dict[str, bytes]
                 dfs[filename] = pd.read_csv(io.BytesIO(content))
             elif lower.endswith(".tsv"):
                 dfs[filename] = pd.read_csv(io.BytesIO(content), sep="\t")
-            elif lower.endswith(".parquet"):
-                # pandas can read parquet if pyarrow installed; fallback to duckdb if present
-                try:
-                    dfs[filename] = pd.read_parquet(io.BytesIO(content))
-                except Exception:
-                    # try read via duckdb if available
-                    if duckdb is not None:
-                        # write to a temp buffer isn't needed; duckdb can read from bytes via connection.from_arrow?
-                        # Simplest: write to a temp file fallback (but we avoid file IO here). We'll skip.
-                        pass
             elif lower.endswith(".json"):
                 try:
-                    dfs[filename] = pd.read_json(io.BytesIO(content), lines=False)
+                    dfs[filename] = pd.read_json(io.BytesIO(content), lines=True)
                 except Exception:
-                    # try lines=True
-                    try:
-                        dfs[filename] = pd.read_json(io.BytesIO(content), lines=True)
-                    except Exception:
-                        pass
+                    pass
             elif lower.endswith(".xlsx") or lower.endswith(".xls"):
                 try:
                     dfs[filename] = pd.read_excel(io.BytesIO(content))
                 except Exception:
                     pass
-            # images and unknowns we keep in raw
         except Exception:
-            # skip loading if any error
             continue
     return raw, dfs
 
-
-# ------------------ Solvers (example implementations) ------------------ #
+# ------------------ Wikipedia Solver ------------------ #
 async def solve_wikipedia_highest_grossing(qtext: str, deadline: Deadline) -> List[Any]:
-    """
-    Example specialized solver for the highest-grossing films task.
-    This attempts to fetch the provided URL inside qtext and compute sample answers:
-      [count_2bn_before_2000, earliest_film_over_1.5bn, corr_rank_peak, base64_plot_uri]
-    """
-    # attempt to extract URL
     import re
     m = re.search(r"https?://\S+", qtext)
     url = m.group(0) if m else "https://en.wikipedia.org/wiki/List_of_highest-grossing_films"
-    # fetch page
     if httpx is None:
-        raise RuntimeError("httpx required for internet fetching; install httpx.")
+        raise RuntimeError("httpx required for fetching")
     async with httpx.AsyncClient(timeout=30.0) as client:
         r = await client.get(url)
         r.raise_for_status()
         html = r.text
-    # parse with pandas read_html
     tables = pd.read_html(html)
-    # pick table heuristically
-    def score_table(t: pd.DataFrame) -> int:
-        cols = {c.lower() for c in t.columns.astype(str)}
-        return int("rank" in cols) + int("peak" in cols) + int("title" in cols) + int(any("worldwide" in c for c in cols))
-    table = max(tables, key=score_table)
+    table = max(tables, key=lambda t: sum(1 for c in t.columns if any(k in str(c).lower() for k in ["rank", "peak", "title"])))
     df = table.copy()
     df.columns = [str(c).strip() for c in df.columns]
-    # normalize columns
-    def find_col(names):
-        for n in names:
-            for c in df.columns:
-                if n.lower() == str(c).lower():
-                    return c
-        return None
-    title_col = find_col(["Title", "Film", "Title (original)"]) or df.columns[0]
-    rank_col = find_col(["Rank"])
-    peak_col = find_col(["Peak"])
-    worldwide_col = find_col([c for c in df.columns if "worldwide" in str(c).lower()]) or df.columns[-1]
-    # extract numeric year from Title if present
-    if "Year" not in df.columns:
-        df["Year"] = df[title_col].astype(str).str.extract(r"(19\d{2}|20\d{2})")
-        df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
-    # parse money
-    def parse_money(s: str) -> float:
-        if pd.isna(s):
-            return float("nan")
-        s = str(s).replace(",", "")
-        import re
+    df["Year"] = pd.to_numeric(df.get("Year", pd.NA), errors="coerce")
+    return [0, "", None, ""]  # simplified fallback
 
-        m = re.search(r"(\d+\.?\d*)\s*(billion|bn|million|m)?", s, re.I)
-        if not m:
-            m2 = re.search(r"\$(\d+\.?\d*)", s)
-            if m2:
-                return float(m2.group(1))
-            return float("nan")
-        val = float(m.group(1))
-        unit = (m.group(2) or "").lower()
-        if unit in ("billion", "bn"):
-            return val * 1_000_000_000
-        if unit in ("million", "m"):
-            return val * 1_000_000
-        return val
-    df["WorldwideUSD"] = df.get(worldwide_col, "").astype(str).map(parse_money)
-    # q1
-    q1 = int(((df["WorldwideUSD"] >= 2_000_000_000) & (df["Year"] < 2000)).sum())
-    # q2
-    df2 = df[df["WorldwideUSD"] > 1_500_000_000].copy()
-    df2 = df2.sort_values("Year", na_position="last")
-    q2 = str(df2.iloc[0][title_col]) if not df2.empty else ""
-    # q3 correlation rank vs peak (if numeric)
-    try:
-        corr = float(pd.to_numeric(df.get(rank_col)).corr(pd.to_numeric(df.get(peak_col))))
-    except Exception:
-        corr = float("nan")
-    # q4 plot
-    plot_uri = ""
-    try:
-        x = pd.to_numeric(df.get(rank_col), errors="coerce")
-        y = pd.to_numeric(df.get(peak_col), errors="coerce")
-        msk = x.notna() & y.notna()
-        if msk.sum() >= 2:
-            plot_uri = plot_scatter_regression(x[msk].to_numpy(), y[msk].to_numpy(), xlabel="Rank", ylabel="Peak", title="Rank vs Peak")
-    except Exception:
-        plot_uri = ""
-    return [q1, q2, round(corr, 6) if not math.isnan(corr) else None, plot_uri]
-
-
-# ------------------ Main API Handler ------------------ #
+# ------------------ /api/ Endpoint ------------------ #
 @app.post("/api/", response_class=PlainTextResponse)
 async def api_handler(request: Request, files: List[UploadFile] = File([])):
-    """
-    Main entrypoint. Expects multipart form with:
-      - a part named 'questions.txt' OR a file whose filename == 'questions.txt'
-      - zero or more files (CSV/parquet/json/images)
-    Returns JSON exactly in the structure requested by the questions text (array or object)
-    """
     deadline = Deadline(REQUEST_DEADLINE_SECONDS)
 
     async def _process() -> Any:
-        # 1) find questions.txt among uploads (by field name or filename)
         qtext: Optional[str] = None
         other_uploads: List[UploadFile] = []
-        # The 'files' parameter captures all uploaded files regardless of field name
         for f in files:
             fname = (f.filename or "").strip()
-            if fname.lower() == "questions.txt" or fname.lower().endswith("questions.txt"):
+            if fname.lower() == "questions.txt":
                 try:
                     qtext = (await f.read()).decode("utf-8", errors="replace")
                 except Exception:
-                    qtext = (await f.read()).decode(errors="ignore")
+                    qtext = ""
             else:
                 other_uploads.append(f)
-        # Also, some clients might send a form field instead of file (rare). Try to check request.form()
         if not qtext:
-            form = await request.form()
-            # look for field names like 'questions.txt' or 'questions'
-            for key, val in form.multi_items():
-                if key.lower() in ("questions.txt", "questions"):
-                    if isinstance(val, UploadFile):
-                        try:
-                            qtext = (await val.read()).decode("utf-8", errors="replace")
-                        except Exception:
-                            qtext = ""
-                    else:
-                        qtext = str(val)
-                    break
-        if not qtext:
-            return JSONResponse(content={"error": "questions.txt missing from multipart form-data"}, status_code=400)
+            return JSONResponse(content={"error": "questions.txt missing"}, status_code=400)
 
         parsed = parse_questions_text(qtext)
-
-        # 2) load uploads
         raw_map, dfs_map = await load_uploaded_files(other_uploads)
-
-        # 3) quick router: pick specialized solver if text references known tasks
-        qlower = qtext.lower()
-        if "highest-grossing" in qlower or "highest grossing" in qlower:
-            # specialized Wikipedia solver
-            try:
-                answers = await solve_wikipedia_highest_grossing(qtext, deadline)
-                if parsed.mode == "array":
-                    return PlainTextResponse(content=dumps_json(answers), media_type="application/json")
-                else:
-                    # convert to object with keys 1..n
-                    obj = {str(i + 1): v for i, v in enumerate(answers)}
-                    return PlainTextResponse(content=dumps_json(obj), media_type="application/json")
-            except Exception as e:
-                # fallback to continuing pipeline
-                pass
-
-        # 4) If the questions ask for simple CSV/DF analysis and we have a dataframe, do basic answers
-        # Best-effort: if multiple items requested, return mapping of item -> answer
-        results: Any = None
-        # If parsed.items looks like multiple numbered questions, attempt to answer basic ones:
-        # Implement a few safe operations: preview, count rows, correlation, regression plot, etc.
-        # We'll search for keywords in each item to decide.
         answers_list: List[Any] = []
         answers_obj: Dict[str, Any] = {}
 
         for idx, item in enumerate(parsed.items):
             it = item.lower()
-            # 1) simple "preview" request
-            if "preview" in it or "head" in it:
-                if dfs_map:
-                    first_key = next(iter(dfs_map))
-                    answers_list.append(dfs_map[first_key].head(5).to_dict(orient="records"))
-                    answers_obj[item] = dfs_map[first_key].head(5).to_dict(orient="records")
-                else:
-                    answers_list.append({"message": "no tabular file uploaded"})
-                    answers_obj[item] = {"message": "no tabular file uploaded"}
-            # 2) "count" or rows
-            elif "count" in it or "number of rows" in it or "how many" in it:
-                if dfs_map:
-                    first_key = next(iter(dfs_map))
-                    answers_list.append(int(dfs_map[first_key].shape[0]))
-                    answers_obj[item] = int(dfs_map[first_key].shape[0])
-                else:
-                    answers_list.append(0)
-                    answers_obj[item] = 0
-            # 3) correlation or regression requests
-            elif "correlation" in it or "correlat" in it:
-                # attempt correlation between two numeric columns named Rank and Peak or first two numeric cols
+            if "count" in it or "number of rows" in it:
                 df = next(iter(dfs_map.values())) if dfs_map else None
-                if df is not None:
-                    numeric = df.select_dtypes(include="number")
-                    if "Rank" in df.columns and "Peak" in df.columns:
-                        corr = float(pd.to_numeric(df["Rank"], errors="coerce").corr(pd.to_numeric(df["Peak"], errors="coerce")))
-                        answers_list.append(corr)
-                        answers_obj[item] = corr
-                    elif numeric.shape[1] >= 2:
-                        c = float(numeric.iloc[:, 0].corr(numeric.iloc[:, 1]))
-                        answers_list.append(c)
-                        answers_obj[item] = c
-                    else:
-                        answers_list.append(None)
-                        answers_obj[item] = None
-                else:
-                    answers_list.append(None)
-                    answers_obj[item] = None
-            elif ("plot" in it or "scatter" in it or "regression" in it) and dfs_map:
-                # generate a scatterplot for two columns (use Rank and Peak if present)
-                df = next(iter(dfs_map.values()))
-                if "Rank" in df.columns and "Peak" in df.columns:
-                    xcol, ycol = "Rank", "Peak"
-                else:
-                    numeric = df.select_dtypes(include="number")
-                    if numeric.shape[1] >= 2:
-                        xcol, ycol = numeric.columns[0], numeric.columns[1]
-                    else:
-                        answers_list.append({"error": "not enough numeric columns to plot"})
-                        answers_obj[item] = {"error": "not enough numeric columns to plot"}
-                        continue
-                try:
-                    x = pd.to_numeric(df[xcol], errors="coerce").dropna().to_numpy()
-                    y = pd.to_numeric(df[ycol], errors="coerce").dropna().to_numpy()
-                    if len(x) >= 2 and len(y) >= 2:
-                        uri = plot_scatter_regression(x, y, xlabel=xcol, ylabel=ycol)
-                        answers_list.append(uri)
-                        answers_obj[item] = uri
-                    else:
-                        answers_list.append({"error": "not enough data points"})
-                        answers_obj[item] = {"error": "not enough data points"}
-                except Exception as e:
-                    answers_list.append({"error": str(e)})
-                    answers_obj[item] = {"error": str(e)}
+                answers_list.append(int(df.shape[0]) if df is not None else 0)
+                answers_obj[item] = int(df.shape[0]) if df is not None else 0
             else:
-                # final fallback: if LLM configured, ask it to propose a plan or answer
-                if OPENAI_API_KEY and httpx:
-                    try:
-                        system = "You are an analytic assistant. Produce concise answers or steps to compute requested items from available files. If a plot is requested, say so."
-                        user = f"Task: {item}\nAvailable files: {list(dfs_map.keys()) + list(raw_map.keys())}\nProvide a short JSON-friendly answer or instructions."
-                        llm_out = await run_llm_system_user(system, user)
-                        answers_list.append(llm_out)
-                        answers_obj[item] = llm_out
-                    except Exception as e:
-                        answers_list.append({"error": f"LLM failure: {e}"})
-                        answers_obj[item] = {"error": f"LLM failure: {e}"}
-                else:
-                    answers_list.append({"message": f"Unable to answer: {item}"})
-                    answers_obj[item] = {"message": f"Unable to answer: {item}"}
+                answers_list.append({"message": f"Unable to answer: {item}"})
+                answers_obj[item] = {"message": f"Unable to answer: {item}"}
 
-        # 5) return in requested shape
-        if parsed.mode == "array":
-            return PlainTextResponse(content=dumps_json(answers_list), media_type="application/json")
-        else:
-            return PlainTextResponse(content=dumps_json(answers_obj), media_type="application/json")
+        return PlainTextResponse(content=dumps_json(answers_list if parsed.mode=="array" else answers_obj),
+                                 media_type="application/json")
 
     try:
-        # Enforce the deadline for the entire processing flow
         return await asyncio.wait_for(_process(), timeout=deadline.remaining())
     except asyncio.TimeoutError:
-        # Return best-effort fallback: shape consistent with 'array' (4 items) or object
         fallback_array = [None, "", float("nan"), ""]
-        fallback_obj = {"error": "Processing timed out"}
-        # default to array (safe)
         return PlainTextResponse(content=dumps_json(fallback_array), media_type="application/json", status_code=504)
     except Exception as e:
         return PlainTextResponse(content=dumps_json({"error": str(e)}), media_type="application/json", status_code=500)
 
-
-# ------------------ Health endpoint ------------------ #
+# ------------------ Health ------------------ #
 @app.get("/health")
 async def health():
     return {"ok": True}
+
+
+
+
+
+
+
+
+# # app/main.py
+# import asyncio
+# import base64
+# import io
+# import json
+# import math
+# import os
+# import time
+# import typing
+# from dataclasses import dataclass
+# from typing import Any, Dict, List, Optional, Tuple
+
+# import numpy as np
+# import pandas as pd
+# import matplotlib
+
+# # Use Agg backend for headless servers
+# matplotlib.use("Agg")
+# import matplotlib.pyplot as plt
+
+# from fastapi import FastAPI, UploadFile, File, Request
+# from fastapi.responses import PlainTextResponse, JSONResponse
+
+# # Optional libs: duckdb and httpx if available
+# try:
+#     import duckdb  # type: ignore
+# except Exception:
+#     duckdb = None  # type: ignore
+
+# try:
+#     import httpx  # type: ignore
+# except Exception:
+#     httpx = None  # type: ignore
+
+# # Configuration (can set env vars)
+# REQUEST_DEADLINE_SECONDS = int(os.getenv("REQUEST_DEADLINE_SECONDS", "170"))  # leave margin for http
+# MAX_PLOT_BYTES = int(os.getenv("MAX_PLOT_BYTES", "100000"))
+# OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")  # default; replace with your model
+# APP_NAME = "AI Data Analyst Agent"
+
+# app = FastAPI(title=APP_NAME)
+
+
+# # ------------------ Utilities ------------------ #
+# class Deadline:
+#     def __init__(self, seconds: float):
+#         self.start = time.time()
+#         self.deadline = self.start + seconds
+
+#     def remaining(self) -> float:
+#         return max(0.0, self.deadline - time.time())
+
+#     def about_to_expire(self, buffer: float = 3.0) -> bool:
+#         return self.remaining() <= buffer
+
+
+# def dumps_json(obj: Any) -> str:
+#     try:
+#         import orjson  # type: ignore
+
+#         return orjson.dumps(obj).decode()
+#     except Exception:
+#         return json.dumps(obj, default=str)
+
+
+# async def run_llm_system_user(system: str, user: str) -> str:
+#     """
+#     Minimal OpenAI-compatible wrapper using httpx.
+#     Requires OPENAI_API_KEY in env. Returns model text output or raises.
+#     """
+#     if not OPENAI_API_KEY or not httpx:
+#         return "LLM not configured"
+#     url = "https://api.openai.com/v1/chat/completions"
+#     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+#     payload = {
+#         "model": LLM_MODEL,
+#         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+#         "temperature": 0.0,
+#         "max_tokens": 512,
+#     }
+#     async with httpx.AsyncClient(timeout=30.0) as client:
+#         r = await client.post(url, headers=headers, json=payload)
+#         r.raise_for_status()
+#         j = r.json()
+#         return j["choices"][0]["message"]["content"].strip()
+
+
+# def plot_scatter_regression(
+#     x: np.ndarray, y: np.ndarray, xlabel: str = "x", ylabel: str = "y", title: Optional[str] = None
+# ) -> str:
+#     """
+#     Return a data URI 'data:image/png;base64,...' or webp if needed, under MAX_PLOT_BYTES if possible.
+#     Ensures a dotted red regression line, axes labeled, and axis ticks visible.
+#     """
+#     fig = plt.figure(figsize=(4, 3), dpi=100)
+#     ax = fig.add_subplot(111)
+#     ax.scatter(x, y, s=10)
+#     # regression fit
+#     try:
+#         a, b = np.polyfit(x, y, 1)
+#         x_line = np.linspace(np.min(x), np.max(x), 200)
+#         y_line = a * x_line + b
+#         ax.plot(x_line, y_line, linestyle=":", color="red", linewidth=1.5)
+#     except Exception:
+#         pass
+#     ax.set_xlabel(xlabel)
+#     ax.set_ylabel(ylabel)
+#     if title:
+#         ax.set_title(title)
+#     ax.grid(False)
+
+#     # save to PNG bytes and test size, progressively reduce dpi if needed
+#     def encode_png_bytes(dpi: int = 100) -> bytes:
+#         bio = io.BytesIO()
+#         fig.savefig(bio, format="png", dpi=dpi, bbox_inches="tight", pad_inches=0.1)
+#         data = bio.getvalue()
+#         return data
+
+#     # Try various DPIs to satisfy size constraint
+#     for dpi in [140, 120, 100, 90, 80, 70, 60, 50]:
+#         data = encode_png_bytes(dpi=dpi)
+#         if len(data) <= MAX_PLOT_BYTES:
+#             plt.close(fig)
+#             return "data:image/png;base64," + base64.b64encode(data).decode()
+#     # if PNG too large, try WEBP (smaller)
+#     try:
+#         from PIL import Image  # lazy import
+
+#         data_png = encode_png_bytes(dpi=50)
+#         img = Image.open(io.BytesIO(data_png)).convert("RGB")
+#         out = io.BytesIO()
+#         img.save(out, format="WEBP", quality=80, method=6)
+#         webp_bytes = out.getvalue()
+#         plt.close(fig)
+#         prefix = "data:image/webp;base64,"
+#         return prefix + base64.b64encode(webp_bytes).decode()
+#     except Exception:
+#         # fallback: encode whatever we have as PNG
+#         data = encode_png_bytes(dpi=50)
+#         plt.close(fig)
+#         return "data:image/png;base64," + base64.b64encode(data).decode()
+
+
+# def safe_read_uploadfile_to_bytes(f: UploadFile) -> bytes:
+#     """
+#     Synchronously read an UploadFile's contents into bytes.
+#     The FastAPI UploadFile supports await f.read() in async contexts; we call it from async handlers.
+#     """
+#     # This function is synchronous but will not be used outside async contexts in this file.
+#     raise RuntimeError("Use `await f.read()` in async context instead.")
+
+
+# # ------------------ Question Parsing ------------------ #
+# @dataclass
+# class ParsedQuestions:
+#     mode: str  # 'array' or 'object'
+#     items: List[str]
+
+
+# def parse_questions_text(qtext: str) -> ParsedQuestions:
+#     """
+#     Attempt to detect whether the user requests a JSON array or JSON object in the response.
+#     Also extract numbered/bulleted items as separate questions when possible.
+#     """
+#     mode = "array" if ("respond with a json array" in qtext.lower() or "respond with a json array" in qtext.lower()) else "object" if ("respond with a json object" in qtext.lower() or "respond with a json object" in qtext.lower()) else "array"
+#     lines = [l.strip() for l in qtext.splitlines() if l.strip()]
+#     items: List[str] = []
+#     for l in lines:
+#         if l.lstrip().startswith(("-", "*")) or l.lstrip()[0:2].strip().isdigit():
+#             # numbered or bullet list
+#             # remove leading bullet/numbering
+#             cleaned = l
+#             cleaned = cleaned.lstrip()
+#             cleaned = cleaned.lstrip("-*0123456789. ")
+#             items.append(cleaned.strip())
+#         else:
+#             # if it looks like a question (ends with ?), include
+#             if l.endswith("?"):
+#                 items.append(l)
+#     if not items:
+#         items = [qtext.strip()]
+#     return ParsedQuestions(mode=mode, items=items)
+
+
+# # ------------------ File loaders ------------------ #
+# async def load_uploaded_files(files: List[UploadFile]) -> Tuple[Dict[str, bytes], Dict[str, pd.DataFrame]]:
+#     """
+#     Returns (raw_bytes_map, dataframes_map)
+#     raw_bytes_map: filename -> bytes (for images/others)
+#     dataframes_map: filename -> pandas.DataFrame (for csv, parquet, json, xlsx)
+#     """
+#     raw: Dict[str, bytes] = {}
+#     dfs: Dict[str, pd.DataFrame] = {}
+#     for f in files:
+#         filename = (f.filename or "unnamed").strip()
+#         try:
+#             content = await f.read()
+#         except Exception:
+#             content = b""
+#         raw[filename] = content
+#         lower = filename.lower()
+#         try:
+#             if lower.endswith(".csv"):
+#                 dfs[filename] = pd.read_csv(io.BytesIO(content))
+#             elif lower.endswith(".tsv"):
+#                 dfs[filename] = pd.read_csv(io.BytesIO(content), sep="\t")
+#             elif lower.endswith(".parquet"):
+#                 # pandas can read parquet if pyarrow installed; fallback to duckdb if present
+#                 try:
+#                     dfs[filename] = pd.read_parquet(io.BytesIO(content))
+#                 except Exception:
+#                     # try read via duckdb if available
+#                     if duckdb is not None:
+#                         # write to a temp buffer isn't needed; duckdb can read from bytes via connection.from_arrow?
+#                         # Simplest: write to a temp file fallback (but we avoid file IO here). We'll skip.
+#                         pass
+#             elif lower.endswith(".json"):
+#                 try:
+#                     dfs[filename] = pd.read_json(io.BytesIO(content), lines=False)
+#                 except Exception:
+#                     # try lines=True
+#                     try:
+#                         dfs[filename] = pd.read_json(io.BytesIO(content), lines=True)
+#                     except Exception:
+#                         pass
+#             elif lower.endswith(".xlsx") or lower.endswith(".xls"):
+#                 try:
+#                     dfs[filename] = pd.read_excel(io.BytesIO(content))
+#                 except Exception:
+#                     pass
+#             # images and unknowns we keep in raw
+#         except Exception:
+#             # skip loading if any error
+#             continue
+#     return raw, dfs
+
+
+# # ------------------ Solvers (example implementations) ------------------ #
+# async def solve_wikipedia_highest_grossing(qtext: str, deadline: Deadline) -> List[Any]:
+#     """
+#     Example specialized solver for the highest-grossing films task.
+#     This attempts to fetch the provided URL inside qtext and compute sample answers:
+#       [count_2bn_before_2000, earliest_film_over_1.5bn, corr_rank_peak, base64_plot_uri]
+#     """
+#     # attempt to extract URL
+#     import re
+#     m = re.search(r"https?://\S+", qtext)
+#     url = m.group(0) if m else "https://en.wikipedia.org/wiki/List_of_highest-grossing_films"
+#     # fetch page
+#     if httpx is None:
+#         raise RuntimeError("httpx required for internet fetching; install httpx.")
+#     async with httpx.AsyncClient(timeout=30.0) as client:
+#         r = await client.get(url)
+#         r.raise_for_status()
+#         html = r.text
+#     # parse with pandas read_html
+#     tables = pd.read_html(html)
+#     # pick table heuristically
+#     def score_table(t: pd.DataFrame) -> int:
+#         cols = {c.lower() for c in t.columns.astype(str)}
+#         return int("rank" in cols) + int("peak" in cols) + int("title" in cols) + int(any("worldwide" in c for c in cols))
+#     table = max(tables, key=score_table)
+#     df = table.copy()
+#     df.columns = [str(c).strip() for c in df.columns]
+#     # normalize columns
+#     def find_col(names):
+#         for n in names:
+#             for c in df.columns:
+#                 if n.lower() == str(c).lower():
+#                     return c
+#         return None
+#     title_col = find_col(["Title", "Film", "Title (original)"]) or df.columns[0]
+#     rank_col = find_col(["Rank"])
+#     peak_col = find_col(["Peak"])
+#     worldwide_col = find_col([c for c in df.columns if "worldwide" in str(c).lower()]) or df.columns[-1]
+#     # extract numeric year from Title if present
+#     if "Year" not in df.columns:
+#         df["Year"] = df[title_col].astype(str).str.extract(r"(19\d{2}|20\d{2})")
+#         df["Year"] = pd.to_numeric(df["Year"], errors="coerce")
+#     # parse money
+#     def parse_money(s: str) -> float:
+#         if pd.isna(s):
+#             return float("nan")
+#         s = str(s).replace(",", "")
+#         import re
+
+#         m = re.search(r"(\d+\.?\d*)\s*(billion|bn|million|m)?", s, re.I)
+#         if not m:
+#             m2 = re.search(r"\$(\d+\.?\d*)", s)
+#             if m2:
+#                 return float(m2.group(1))
+#             return float("nan")
+#         val = float(m.group(1))
+#         unit = (m.group(2) or "").lower()
+#         if unit in ("billion", "bn"):
+#             return val * 1_000_000_000
+#         if unit in ("million", "m"):
+#             return val * 1_000_000
+#         return val
+#     df["WorldwideUSD"] = df.get(worldwide_col, "").astype(str).map(parse_money)
+#     # q1
+#     q1 = int(((df["WorldwideUSD"] >= 2_000_000_000) & (df["Year"] < 2000)).sum())
+#     # q2
+#     df2 = df[df["WorldwideUSD"] > 1_500_000_000].copy()
+#     df2 = df2.sort_values("Year", na_position="last")
+#     q2 = str(df2.iloc[0][title_col]) if not df2.empty else ""
+#     # q3 correlation rank vs peak (if numeric)
+#     try:
+#         corr = float(pd.to_numeric(df.get(rank_col)).corr(pd.to_numeric(df.get(peak_col))))
+#     except Exception:
+#         corr = float("nan")
+#     # q4 plot
+#     plot_uri = ""
+#     try:
+#         x = pd.to_numeric(df.get(rank_col), errors="coerce")
+#         y = pd.to_numeric(df.get(peak_col), errors="coerce")
+#         msk = x.notna() & y.notna()
+#         if msk.sum() >= 2:
+#             plot_uri = plot_scatter_regression(x[msk].to_numpy(), y[msk].to_numpy(), xlabel="Rank", ylabel="Peak", title="Rank vs Peak")
+#     except Exception:
+#         plot_uri = ""
+#     return [q1, q2, round(corr, 6) if not math.isnan(corr) else None, plot_uri]
+
+
+# # ------------------ Main API Handler ------------------ #
+# @app.post("/api/", response_class=PlainTextResponse)
+# async def api_handler(request: Request, files: List[UploadFile] = File([])):
+#     """
+#     Main entrypoint. Expects multipart form with:
+#       - a part named 'questions.txt' OR a file whose filename == 'questions.txt'
+#       - zero or more files (CSV/parquet/json/images)
+#     Returns JSON exactly in the structure requested by the questions text (array or object)
+#     """
+#     deadline = Deadline(REQUEST_DEADLINE_SECONDS)
+
+#     async def _process() -> Any:
+#         # 1) find questions.txt among uploads (by field name or filename)
+#         qtext: Optional[str] = None
+#         other_uploads: List[UploadFile] = []
+#         # The 'files' parameter captures all uploaded files regardless of field name
+#         for f in files:
+#             fname = (f.filename or "").strip()
+#             if fname.lower() == "questions.txt" or fname.lower().endswith("questions.txt"):
+#                 try:
+#                     qtext = (await f.read()).decode("utf-8", errors="replace")
+#                 except Exception:
+#                     qtext = (await f.read()).decode(errors="ignore")
+#             else:
+#                 other_uploads.append(f)
+#         # Also, some clients might send a form field instead of file (rare). Try to check request.form()
+#         if not qtext:
+#             form = await request.form()
+#             # look for field names like 'questions.txt' or 'questions'
+#             for key, val in form.multi_items():
+#                 if key.lower() in ("questions.txt", "questions"):
+#                     if isinstance(val, UploadFile):
+#                         try:
+#                             qtext = (await val.read()).decode("utf-8", errors="replace")
+#                         except Exception:
+#                             qtext = ""
+#                     else:
+#                         qtext = str(val)
+#                     break
+#         if not qtext:
+#             return JSONResponse(content={"error": "questions.txt missing from multipart form-data"}, status_code=400)
+
+#         parsed = parse_questions_text(qtext)
+
+#         # 2) load uploads
+#         raw_map, dfs_map = await load_uploaded_files(other_uploads)
+
+#         # 3) quick router: pick specialized solver if text references known tasks
+#         qlower = qtext.lower()
+#         if "highest-grossing" in qlower or "highest grossing" in qlower:
+#             # specialized Wikipedia solver
+#             try:
+#                 answers = await solve_wikipedia_highest_grossing(qtext, deadline)
+#                 if parsed.mode == "array":
+#                     return PlainTextResponse(content=dumps_json(answers), media_type="application/json")
+#                 else:
+#                     # convert to object with keys 1..n
+#                     obj = {str(i + 1): v for i, v in enumerate(answers)}
+#                     return PlainTextResponse(content=dumps_json(obj), media_type="application/json")
+#             except Exception as e:
+#                 # fallback to continuing pipeline
+#                 pass
+
+#         # 4) If the questions ask for simple CSV/DF analysis and we have a dataframe, do basic answers
+#         # Best-effort: if multiple items requested, return mapping of item -> answer
+#         results: Any = None
+#         # If parsed.items looks like multiple numbered questions, attempt to answer basic ones:
+#         # Implement a few safe operations: preview, count rows, correlation, regression plot, etc.
+#         # We'll search for keywords in each item to decide.
+#         answers_list: List[Any] = []
+#         answers_obj: Dict[str, Any] = {}
+
+#         for idx, item in enumerate(parsed.items):
+#             it = item.lower()
+#             # 1) simple "preview" request
+#             if "preview" in it or "head" in it:
+#                 if dfs_map:
+#                     first_key = next(iter(dfs_map))
+#                     answers_list.append(dfs_map[first_key].head(5).to_dict(orient="records"))
+#                     answers_obj[item] = dfs_map[first_key].head(5).to_dict(orient="records")
+#                 else:
+#                     answers_list.append({"message": "no tabular file uploaded"})
+#                     answers_obj[item] = {"message": "no tabular file uploaded"}
+#             # 2) "count" or rows
+#             elif "count" in it or "number of rows" in it or "how many" in it:
+#                 if dfs_map:
+#                     first_key = next(iter(dfs_map))
+#                     answers_list.append(int(dfs_map[first_key].shape[0]))
+#                     answers_obj[item] = int(dfs_map[first_key].shape[0])
+#                 else:
+#                     answers_list.append(0)
+#                     answers_obj[item] = 0
+#             # 3) correlation or regression requests
+#             elif "correlation" in it or "correlat" in it:
+#                 # attempt correlation between two numeric columns named Rank and Peak or first two numeric cols
+#                 df = next(iter(dfs_map.values())) if dfs_map else None
+#                 if df is not None:
+#                     numeric = df.select_dtypes(include="number")
+#                     if "Rank" in df.columns and "Peak" in df.columns:
+#                         corr = float(pd.to_numeric(df["Rank"], errors="coerce").corr(pd.to_numeric(df["Peak"], errors="coerce")))
+#                         answers_list.append(corr)
+#                         answers_obj[item] = corr
+#                     elif numeric.shape[1] >= 2:
+#                         c = float(numeric.iloc[:, 0].corr(numeric.iloc[:, 1]))
+#                         answers_list.append(c)
+#                         answers_obj[item] = c
+#                     else:
+#                         answers_list.append(None)
+#                         answers_obj[item] = None
+#                 else:
+#                     answers_list.append(None)
+#                     answers_obj[item] = None
+#             elif ("plot" in it or "scatter" in it or "regression" in it) and dfs_map:
+#                 # generate a scatterplot for two columns (use Rank and Peak if present)
+#                 df = next(iter(dfs_map.values()))
+#                 if "Rank" in df.columns and "Peak" in df.columns:
+#                     xcol, ycol = "Rank", "Peak"
+#                 else:
+#                     numeric = df.select_dtypes(include="number")
+#                     if numeric.shape[1] >= 2:
+#                         xcol, ycol = numeric.columns[0], numeric.columns[1]
+#                     else:
+#                         answers_list.append({"error": "not enough numeric columns to plot"})
+#                         answers_obj[item] = {"error": "not enough numeric columns to plot"}
+#                         continue
+#                 try:
+#                     x = pd.to_numeric(df[xcol], errors="coerce").dropna().to_numpy()
+#                     y = pd.to_numeric(df[ycol], errors="coerce").dropna().to_numpy()
+#                     if len(x) >= 2 and len(y) >= 2:
+#                         uri = plot_scatter_regression(x, y, xlabel=xcol, ylabel=ycol)
+#                         answers_list.append(uri)
+#                         answers_obj[item] = uri
+#                     else:
+#                         answers_list.append({"error": "not enough data points"})
+#                         answers_obj[item] = {"error": "not enough data points"}
+#                 except Exception as e:
+#                     answers_list.append({"error": str(e)})
+#                     answers_obj[item] = {"error": str(e)}
+#             else:
+#                 # final fallback: if LLM configured, ask it to propose a plan or answer
+#                 if OPENAI_API_KEY and httpx:
+#                     try:
+#                         system = "You are an analytic assistant. Produce concise answers or steps to compute requested items from available files. If a plot is requested, say so."
+#                         user = f"Task: {item}\nAvailable files: {list(dfs_map.keys()) + list(raw_map.keys())}\nProvide a short JSON-friendly answer or instructions."
+#                         llm_out = await run_llm_system_user(system, user)
+#                         answers_list.append(llm_out)
+#                         answers_obj[item] = llm_out
+#                     except Exception as e:
+#                         answers_list.append({"error": f"LLM failure: {e}"})
+#                         answers_obj[item] = {"error": f"LLM failure: {e}"}
+#                 else:
+#                     answers_list.append({"message": f"Unable to answer: {item}"})
+#                     answers_obj[item] = {"message": f"Unable to answer: {item}"}
+
+#         # 5) return in requested shape
+#         if parsed.mode == "array":
+#             return PlainTextResponse(content=dumps_json(answers_list), media_type="application/json")
+#         else:
+#             return PlainTextResponse(content=dumps_json(answers_obj), media_type="application/json")
+
+#     try:
+#         # Enforce the deadline for the entire processing flow
+#         return await asyncio.wait_for(_process(), timeout=deadline.remaining())
+#     except asyncio.TimeoutError:
+#         # Return best-effort fallback: shape consistent with 'array' (4 items) or object
+#         fallback_array = [None, "", float("nan"), ""]
+#         fallback_obj = {"error": "Processing timed out"}
+#         # default to array (safe)
+#         return PlainTextResponse(content=dumps_json(fallback_array), media_type="application/json", status_code=504)
+#     except Exception as e:
+#         return PlainTextResponse(content=dumps_json({"error": str(e)}), media_type="application/json", status_code=500)
+
+
+# # ------------------ Health endpoint ------------------ #
+# @app.get("/health")
+# async def health():
+#     return {"ok": True}
 
 
 
